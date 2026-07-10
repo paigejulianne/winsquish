@@ -1,5 +1,7 @@
 # WinSquish
 
+[![CI](https://github.com/paigejulianne/winsquish/actions/workflows/ci.yml/badge.svg)](https://github.com/paigejulianne/winsquish/actions/workflows/ci.yml)
+
 A small WinRAR-style Windows GUI for the [SQUISH](https://github.com/paigejulianne/squish)
 context-mixing compressor, with Explorer right-click integration.
 
@@ -106,6 +108,19 @@ to `HKCU\Software\Classes`, so it never needs elevation and affects only the
 current user. The registered commands point at the exe's location at the
 time of registration — re-register after moving the exe.
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request (Windows,
+MSVC x64): it builds `winsquish.exe`, runs the round-trip tests, and builds the
+Inno Setup installer, uploading both as artifacts. The tests live in
+`test\roundtrip.ps1` and drive the GUI headlessly (launch → poll for the
+output → terminate), verifying folder, single-file, and self-extracting
+round-trips by SHA-256. Run them locally against a build with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File test\roundtrip.ps1 -Exe build\winsquish.exe
+```
+
 ## Layout
 
 ```
@@ -115,6 +130,8 @@ squish\              libsquish SDK: squish.h + squish.lib (import lib) +
                      squish.dll (linked at run time, shipped in the installer)
 build.bat            one-step MSVC build (links the DLL, copies it to build\)
 installer\           Inno Setup script + one-step installer build
+test\roundtrip.ps1   headless end-to-end round-trip tests
+.github\workflows\   CI: build + test + installer on every push/PR
 ```
 
 ## License
