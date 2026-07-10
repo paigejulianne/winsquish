@@ -1,0 +1,7 @@
+build/
+sign-metadata.json
+*.obj
+*.res
+*.exe
+*.pdb
+*.ilk
