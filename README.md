@@ -68,16 +68,23 @@ ships it. To refresh the DLL, rebuild it in the [SQUISH] repo (`make dll` or
 installer\build-installer.bat
 ```
 
-Produces `build\winsquish-setup.exe`, a per-user installer (requires
+Produces `build\winsquish-setup.exe` (requires
 [Inno Setup](https://jrsoftware.org/isdl.php) 6.3+; it builds
 `winsquish.exe` first if needed). It installs both `winsquish.exe` and its
-`squish.dll` dependency. The installer needs **no administrator
-rights** — it installs into `%LOCALAPPDATA%\Programs\WinSquish`, registers
-the `.sq` file type and Explorer context-menu entries under `HKCU`, adds a
-Start Menu shortcut, and creates an Add/Remove Programs entry. Registration
-is delegated to `winsquish.exe --register`, so the installer and the GUI's
-**Tools ▸ Register** command write exactly the same keys. Uninstalling runs
-`--unregister` (which only drops the `.sq` mapping if it still points at
+`squish.dll` dependency. At startup it asks how to install:
+
+- **For all users** (default, system-wide): installs into
+  `%ProgramFiles%\WinSquish` and registers the `.sq` file type + context-menu
+  entries under `HKLM` for every user. This one choice triggers a single UAC
+  elevation prompt.
+- **For me only** (per-user): installs into `%LOCALAPPDATA%\Programs\WinSquish`
+  and registers under `HKCU`. No administrator rights required.
+
+Either way it adds a Start Menu shortcut and an Add/Remove Programs entry.
+Registration is delegated to `winsquish.exe --register` (with `--allusers` for
+the system-wide scope), so the installer and the GUI's **Tools ▸ Register**
+command write exactly the same keys, into the appropriate root. Uninstalling
+runs `--unregister` (which only drops the `.sq` mapping if it still points at
 WinSquish) before removing the files.
 
 ## Command line
@@ -90,6 +97,8 @@ winsquish.exe --compress-sfx <path> open GUI and build a self-extracting .exe
 winsquish.exe --decompress <file>   open GUI and extract a .sq or an SFX
 winsquish.exe --register            install the context-menu entries (HKCU)
 winsquish.exe --unregister          remove them
+winsquish.exe --register --allusers register system-wide in HKLM (needs admin;
+                                     --allusers also applies to --unregister)
 winsquish.exe --register --quiet    register with no confirmation dialog
                                     (--quiet also applies to --unregister;
                                      used by the installer/uninstaller)

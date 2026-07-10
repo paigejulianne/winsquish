@@ -1,17 +1,20 @@
 ; ==========================================================================
-; WinSquish installer -- per-user, no administrator rights required.
+; WinSquish installer -- lets the user pick a system-wide or per-user install.
+;
+; At startup it asks "Install for all users" (default, system-wide, needs
+; elevation) or "Install for me only" (per-user, no admin). Inno's {auto*}
+; constants then resolve the install location and shortcuts to match the mode.
 ;
 ; Builds a single setup.exe that:
-;   * installs winsquish.exe into %LOCALAPPDATA%\Programs\WinSquish
-;   * registers the .sq file type + Explorer context-menu entries by
-;     invoking "winsquish.exe --register --quiet" -- the app's own per-user
-;     HKCU registration, so the registry layout has one source of truth
+;   * installs winsquish.exe + squish.dll into {autopf}\WinSquish
+;     (Program Files for all-users, %LOCALAPPDATA%\Programs for per-user)
+;   * registers the .sq file type + Explorer context-menu entries by invoking
+;     "winsquish.exe --register [--allusers] --quiet" -- the app's own
+;     registration, into HKLM for all-users or HKCU for per-user, so the
+;     registry layout has one source of truth
 ;   * creates a Start Menu shortcut (and an optional desktop shortcut)
 ;   * adds an Add/Remove Programs entry whose uninstaller unregisters the
 ;     shell integration before deleting the files
-;
-; Everything lives under HKEY_CURRENT_USER and the per-user profile, so the
-; installer never prompts for elevation -- matching the app's design.
 ;
 ; Requires Inno Setup 6.3 or later (uses the x64compatible architecture id).
 ; Compile with:  installer\build-installer.bat   (or: ISCC winsquish.iss)
@@ -55,8 +58,10 @@ SolidCompression=yes
 ; Broadcast SHCNE_ASSOCCHANGED after install/uninstall so Explorer notices
 ; the new (or removed) .sq association without a logoff.
 ChangesAssociations=yes
-; Per-user install: no UAC prompt, everything under the user's profile / HKCU.
-PrivilegesRequired=lowest
+; Offer both scopes at startup (all-users vs. current-user). Default is
+; all-users (system-wide); choosing it triggers a single UAC elevation.
+PrivilegesRequired=admin
+PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 ; The app calls GetDpiForSystem (Windows 10 1607+).
@@ -93,16 +98,20 @@ Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}";     Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Run]
-; Register the .sq file type + context-menu verbs for the current user.
-; runasoriginaluser: register for the real user even if setup was elevated.
-Filename: "{app}\{#AppExe}"; Parameters: "--register --quiet"; StatusMsg: "Registering the .sq file type and context-menu entries..."; Flags: runasoriginaluser
+; Register the .sq file type + context-menu verbs. The scope follows the
+; install mode: HKLM (--allusers, elevated) for a system-wide install, HKCU
+; (as the original user) for a per-user install.
+Filename: "{app}\{#AppExe}"; Parameters: "--register --allusers --quiet"; StatusMsg: "Registering the .sq file type and context-menu entries (all users)..."; Check: IsAdminInstallMode
+Filename: "{app}\{#AppExe}"; Parameters: "--register --quiet"; StatusMsg: "Registering the .sq file type and context-menu entries..."; Flags: runasoriginaluser; Check: not IsAdminInstallMode
 ; Offer to launch WinSquish from the final wizard page.
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
 ; Unregister BEFORE the files are removed -- the exe must still exist to run.
-; --unregister only drops the .sq mapping if it still points at us.
-Filename: "{app}\{#AppExe}"; Parameters: "--unregister --quiet"; RunOnceId: "UnregisterShell"
+; --unregister only drops the .sq mapping if it still points at us. Match the
+; scope the install used.
+Filename: "{app}\{#AppExe}"; Parameters: "--unregister --allusers --quiet"; RunOnceId: "UnregisterShellAll"; Check: IsAdminInstallMode
+Filename: "{app}\{#AppExe}"; Parameters: "--unregister --quiet"; RunOnceId: "UnregisterShell"; Check: not IsAdminInstallMode
 
 [CustomMessages]
 CreateDesktopIcon=Create a &desktop shortcut

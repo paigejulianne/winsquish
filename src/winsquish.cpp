@@ -667,11 +667,17 @@ static int UnpackArchive(const unsigned char *b, size_t len,
     return SQUISH_OK;
 }
 
-/* --- context-menu registration (HKCU\Software\Classes, no admin) -----------*/
-static bool SetRegValue(const std::wstring &key, const wchar_t *name,
+/* --- context-menu registration (Software\Classes) --------------------------
+ * Registration is written under one of two roots:
+ *   HKEY_CURRENT_USER  — a per-user install: no admin rights, this user only.
+ *   HKEY_LOCAL_MACHINE — a system-wide install: all users, needs elevation.
+ * The key layout below is identical either way; only the root differs. The
+ * installer picks the root (all-users vs. per-user) and passes --allusers to
+ * winsquish --register/--unregister; the GUI's Tools menu always uses HKCU. */
+static bool SetRegValue(HKEY root, const std::wstring &key, const wchar_t *name,
                         const std::wstring &val) {
     HKEY hk;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, nullptr, 0,
+    if (RegCreateKeyExW(root, key.c_str(), 0, nullptr, 0,
                         KEY_SET_VALUE, nullptr, &hk, nullptr) != ERROR_SUCCESS)
         return false;
     LONG rc = RegSetValueExW(hk, name, 0, REG_SZ, (const BYTE *)val.c_str(),
@@ -680,82 +686,82 @@ static bool SetRegValue(const std::wstring &key, const wchar_t *name,
     return rc == ERROR_SUCCESS;
 }
 
-static bool RegisterShell(void) {
+static bool RegisterShell(HKEY root) {
     std::wstring exe = ExePath();
     std::wstring quoted = L"\"" + exe + L"\"";
     bool ok = true;
 
     /* "Compress to .sq" on every file type */
     std::wstring k = L"Software\\Classes\\*\\shell\\WinSquish.Compress";
-    ok &= SetRegValue(k, nullptr, L"Compress to .sq (WinSquish)");
-    ok &= SetRegValue(k, L"Icon", quoted);
-    ok &= SetRegValue(k + L"\\command", nullptr, quoted + L" --compress \"%1\"");
+    ok &= SetRegValue(root,k, nullptr, L"Compress to .sq (WinSquish)");
+    ok &= SetRegValue(root,k, L"Icon", quoted);
+    ok &= SetRegValue(root,k + L"\\command", nullptr, quoted + L" --compress \"%1\"");
 
     /* "Compress to self-extracting .exe" on every file type */
     std::wstring ksfx = L"Software\\Classes\\*\\shell\\WinSquish.CompressSfx";
-    ok &= SetRegValue(ksfx, nullptr,
+    ok &= SetRegValue(root,ksfx, nullptr,
                       L"Compress to self-extracting .exe (WinSquish)");
-    ok &= SetRegValue(ksfx, L"Icon", quoted);
-    ok &= SetRegValue(ksfx + L"\\command", nullptr,
+    ok &= SetRegValue(root,ksfx, L"Icon", quoted);
+    ok &= SetRegValue(root,ksfx + L"\\command", nullptr,
                       quoted + L" --compress-sfx \"%1\"");
 
     /* The same two verbs on folders (right-click a directory): the whole tree
      * is packed into a single SQAR archive stream. */
     std::wstring kd = L"Software\\Classes\\Directory\\shell\\WinSquish.Compress";
-    ok &= SetRegValue(kd, nullptr, L"Compress to .sq (WinSquish)");
-    ok &= SetRegValue(kd, L"Icon", quoted);
-    ok &= SetRegValue(kd + L"\\command", nullptr, quoted + L" --compress \"%1\"");
+    ok &= SetRegValue(root,kd, nullptr, L"Compress to .sq (WinSquish)");
+    ok &= SetRegValue(root,kd, L"Icon", quoted);
+    ok &= SetRegValue(root,kd + L"\\command", nullptr, quoted + L" --compress \"%1\"");
 
     std::wstring kdsfx =
         L"Software\\Classes\\Directory\\shell\\WinSquish.CompressSfx";
-    ok &= SetRegValue(kdsfx, nullptr,
+    ok &= SetRegValue(root,kdsfx, nullptr,
                       L"Compress to self-extracting .exe (WinSquish)");
-    ok &= SetRegValue(kdsfx, L"Icon", quoted);
-    ok &= SetRegValue(kdsfx + L"\\command", nullptr,
+    ok &= SetRegValue(root,kdsfx, L"Icon", quoted);
+    ok &= SetRegValue(root,kdsfx + L"\\command", nullptr,
                       quoted + L" --compress-sfx \"%1\"");
 
     /* .sq extension -> ProgID */
-    ok &= SetRegValue(L"Software\\Classes\\" + std::wstring(SQ_EXT),
+    ok &= SetRegValue(root,L"Software\\Classes\\" + std::wstring(SQ_EXT),
                       nullptr, PROGID);
 
     /* ProgID: icon, double-click opens GUI, "Extract" verb */
     std::wstring p = L"Software\\Classes\\" + std::wstring(PROGID);
-    ok &= SetRegValue(p, nullptr, L"SQUISH Compressed File");
-    ok &= SetRegValue(p + L"\\DefaultIcon", nullptr, quoted + L",0");
-    ok &= SetRegValue(p + L"\\shell\\open\\command", nullptr,
+    ok &= SetRegValue(root,p, nullptr, L"SQUISH Compressed File");
+    ok &= SetRegValue(root,p + L"\\DefaultIcon", nullptr, quoted + L",0");
+    ok &= SetRegValue(root,p + L"\\shell\\open\\command", nullptr,
                       quoted + L" \"%1\"");
-    ok &= SetRegValue(p + L"\\shell\\extract", nullptr,
+    ok &= SetRegValue(root,p + L"\\shell\\extract", nullptr,
                       L"Extract with WinSquish");
-    ok &= SetRegValue(p + L"\\shell\\extract", L"Icon", quoted);
-    ok &= SetRegValue(p + L"\\shell\\extract\\command", nullptr,
+    ok &= SetRegValue(root,p + L"\\shell\\extract", L"Icon", quoted);
+    ok &= SetRegValue(root,p + L"\\shell\\extract\\command", nullptr,
                       quoted + L" --decompress \"%1\"");
 
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     return ok;
 }
 
-static void UnregisterShell(void) {
-    RegDeleteTreeW(HKEY_CURRENT_USER,
+static void UnregisterShell(HKEY root) {
+    RegDeleteTreeW(root,
                    L"Software\\Classes\\*\\shell\\WinSquish.Compress");
-    RegDeleteTreeW(HKEY_CURRENT_USER,
+    RegDeleteTreeW(root,
                    L"Software\\Classes\\*\\shell\\WinSquish.CompressSfx");
-    RegDeleteTreeW(HKEY_CURRENT_USER,
+    RegDeleteTreeW(root,
                    L"Software\\Classes\\Directory\\shell\\WinSquish.Compress");
-    RegDeleteTreeW(HKEY_CURRENT_USER,
+    RegDeleteTreeW(root,
                    L"Software\\Classes\\Directory\\shell\\WinSquish.CompressSfx");
-    RegDeleteTreeW(HKEY_CURRENT_USER,
+    RegDeleteTreeW(root,
                    (L"Software\\Classes\\" + std::wstring(PROGID)).c_str());
     /* remove the extension mapping only if it still points at us */
     HKEY hk;
     std::wstring extKey = L"Software\\Classes\\" + std::wstring(SQ_EXT);
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, extKey.c_str(), 0,
+    if (RegOpenKeyExW(root, extKey.c_str(), 0,
                       KEY_QUERY_VALUE, &hk) == ERROR_SUCCESS) {
         wchar_t val[64] = L"";
         DWORD cb = sizeof val, type = 0;
         RegQueryValueExW(hk, nullptr, nullptr, &type, (BYTE *)val, &cb);
         RegCloseKey(hk);
         if (type == REG_SZ && _wcsicmp(val, PROGID) == 0)
-            RegDeleteTreeW(HKEY_CURRENT_USER, extKey.c_str());
+            RegDeleteTreeW(root, extKey.c_str());
     }
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
 }
@@ -1268,7 +1274,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (HIWORD(wp) == EN_KILLFOCUS) UpdateFileInfo();
             return 0;
         case IDM_REGISTER:
-            MessageBoxW(hwnd, RegisterShell()
+            /* The GUI registers per-user (HKCU): no elevation needed. */
+            MessageBoxW(hwnd, RegisterShell(HKEY_CURRENT_USER)
                 ? L"Context-menu entries installed for the current user.\n\n"
                   L"Right-click any file for \"Compress to .sq\" or\n"
                   L"\"Compress to self-extracting .exe\", and any .sq file\n"
@@ -1277,7 +1284,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 APP_NAME, MB_ICONINFORMATION);
             return 0;
         case IDM_UNREGISTER:
-            UnregisterShell();
+            UnregisterShell(HKEY_CURRENT_USER);
             MessageBoxW(hwnd, L"Context-menu entries removed.",
                         APP_NAME, MB_ICONINFORMATION);
             return 0;
@@ -1328,12 +1335,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
     std::wstring file;
     int autoMode = 0;   /* 0=none 1=compress 2=decompress 3=compress-sfx */
     bool quiet = false; /* suppress register/unregister confirmation dialogs */
-    for (int i = 1; i < argc; i++)
-        if (std::wstring(argv[i]) == L"--quiet") quiet = true;
+    bool allUsers = false;  /* register/unregister in HKLM (system-wide) */
+    for (int i = 1; i < argc; i++) {
+        std::wstring a = argv[i];
+        if (a == L"--quiet")         quiet = true;
+        else if (a == L"--allusers") allUsers = true;
+    }
+    HKEY regRoot = allUsers ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER;
     for (int i = 1; i < argc; i++) {
         std::wstring a = argv[i];
         if (a == L"--register") {
-            bool ok = RegisterShell();
+            bool ok = RegisterShell(regRoot);
             if (!quiet)
                 MessageBoxW(nullptr, ok
                     ? L"WinSquish context-menu entries installed."
@@ -1342,7 +1354,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
             return ok ? 0 : 1;
         }
         if (a == L"--unregister") {
-            UnregisterShell();
+            UnregisterShell(regRoot);
             if (!quiet)
                 MessageBoxW(nullptr, L"WinSquish context-menu entries removed.",
                             APP_NAME, MB_ICONINFORMATION);
@@ -1352,6 +1364,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
         else if (a == L"--decompress")     autoMode = 2;
         else if (a == L"--compress-sfx")   autoMode = 3;
         else if (a == L"--quiet")          ; /* handled in the pre-scan above */
+        else if (a == L"--allusers")       ; /* handled in the pre-scan above */
         else if (file.empty())             file = a;
     }
     LocalFree(argv);
