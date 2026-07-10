@@ -35,11 +35,47 @@ if not defined ISCC (
 )
 
 :compile
+rem --- optional Authenticode signing (Azure Trusted Signing) -------------
+rem Mirrors build.bat: enabled when sign-metadata.json exists. Inno then
+rem signs both setup.exe and the uninstaller via the /Swinsquish sign tool.
+if not exist "..\sign-metadata.json" goto :unsigned
+
+set "DLIB=%LOCALAPPDATA%\Microsoft.Trusted.Signing.Client\bin\x64\Azure.CodeSigning.Dlib.dll"
+if not exist "%DLIB%" (
+    echo error: sign-metadata.json present but the Trusted Signing client is
+    echo missing. Expected: %DLIB%
+    exit /b 1
+)
+
+set "SIGNTOOL=signtool.exe"
+where signtool.exe >nul 2>nul
+if not errorlevel 1 goto :havesigntool
+set "SIGNTOOL="
+for /d %%d in ("%ProgramFiles(x86)%\Windows Kits\10\bin\10.*") do if exist "%%d\x64\signtool.exe" set "SIGNTOOL=%%d\x64\signtool.exe"
+if not defined SIGNTOOL (
+    echo error: signtool.exe not found ^(install a Windows 10/11 SDK^).
+    exit /b 1
+)
+:havesigntool
+
+rem Absolute path so signtool finds the metadata regardless of its cwd.
+for %%i in ("..\sign-metadata.json") do set "SIGNMETA=%%~fi"
+
+rem $q -> a literal quote, $f -> the file to sign (Inno fills both in).
+"%ISCC%" /Qp /DSIGN "/Swinsquish=$q%SIGNTOOL%$q sign /v /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib $q%DLIB%$q /dmdf $q%SIGNMETA%$q $f" "winsquish.iss"
+if errorlevel 1 (
+    echo error: Inno Setup compilation/signing failed. Are you logged in? Try: az login
+    exit /b 1
+)
+echo.
+echo Built and signed installer: build\winsquish-setup.exe
+goto :eof
+
+:unsigned
 "%ISCC%" /Qp "winsquish.iss"
 if errorlevel 1 (
     echo error: Inno Setup compilation failed.
     exit /b 1
 )
-
 echo.
-echo Built installer: build\winsquish-setup.exe
+echo Built installer: build\winsquish-setup.exe ^(unsigned; create sign-metadata.json to sign^)

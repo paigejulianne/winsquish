@@ -15,6 +15,11 @@
 ;
 ; Requires Inno Setup 6.3 or later (uses the x64compatible architecture id).
 ; Compile with:  installer\build-installer.bat   (or: ISCC winsquish.iss)
+;
+; Authenticode signing is optional and off by default. build-installer.bat
+; turns it on (signing both setup.exe and the uninstaller) when
+; sign-metadata.json exists, reusing the same Azure Trusted Signing setup as
+; build.bat -- it passes /DSIGN plus a /Swinsquish=... sign command to ISCC.
 ; ==========================================================================
 
 #define AppName "WinSquish"
@@ -59,6 +64,13 @@ MinVersion=10.0
 ; Use Restart Manager to close a running WinSquish so its exe isn't locked.
 CloseApplications=yes
 RestartApplications=no
+; Optional Authenticode signing, enabled by passing /DSIGN to ISCC together
+; with a /Swinsquish=... sign command (build-installer.bat wires this up).
+; Signs both setup.exe and the extracted uninstaller.
+#ifdef SIGN
+SignTool=winsquish
+SignedUninstaller=yes
+#endif
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
