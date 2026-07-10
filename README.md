@@ -7,9 +7,16 @@ context-mixing compressor, with Explorer right-click integration.
 
 ## Features
 
-- **GUI**: pick or drag-and-drop a file, then **Compress** (to `.sq`) or
-  **Extract**, with a live progress bar. Shows the original size stored in a
-  `.sq` stream's header before you extract.
+- **GUI**: pick or drag-and-drop a **file or a folder**, then **Compress**
+  (to `.sq`) or **Extract**, with a live progress bar. Shows the original size
+  stored in a `.sq` stream's header before you extract.
+- **Folders / multi-file archives**: drop a folder (or use **File ▸ Open
+  folder…**) and Compress packs the whole tree into a single `.sq`. The tree is
+  serialized into SQUISH's `SQAR` archive format and compressed as one stream,
+  so a folder `.sq` interoperates byte-for-byte with the `squish` CLI in both
+  directions. Extracting such a `.sq` recreates the directory tree (empty
+  directories and all); extracting a single-file `.sq` writes the file, exactly
+  as before — WinSquish detects which it is automatically.
 - **Self-extracting archives (SFX)**: tick **Create self-extracting archive**
   and Compress produces a Windows `.exe` instead of a `.sq` — WinSquish itself
   is the stub, so double-clicking that `.exe` extracts the payload beside it,
@@ -18,8 +25,9 @@ context-mixing compressor, with Explorer right-click integration.
   extraction only reads the archive's trailer and payload, never the stub, so
   a foreign SFX opens here even though it won't *run* here.
 - **Explorer context menu** (per-user, no admin required):
-  - right-click any file → **Compress to .sq (WinSquish)**
-  - right-click any file → **Compress to self-extracting .exe (WinSquish)**
+  - right-click any file **or folder** → **Compress to .sq (WinSquish)**
+  - right-click any file **or folder** → **Compress to self-extracting .exe
+    (WinSquish)**
   - right-click a `.sq` file → **Extract with WinSquish**
   - double-clicking a `.sq` file opens it in the GUI
 - **CPU cores**: pick how many workers to use (default **4**, capped at the
@@ -43,9 +51,14 @@ Requires Visual Studio with the C++ workload (any recent version).
 build.bat
 ```
 
-This locates Visual Studio via `vswhere`, compiles `src\winsquish.cpp`
-together with the vendored `squish\squish.c`, and produces
-`build\winsquish.exe`. No other dependencies.
+This locates Visual Studio via `vswhere`, compiles `src\winsquish.cpp`, and
+links it against the prebuilt **libsquish DLL** (`squish\squish.lib` is the
+import library) to produce `build\winsquish.exe`. It also copies
+`squish\squish.dll` into `build\` so the exe runs straight from there.
+WinSquish no longer vendors the compressor's `.c` source — it links the DLL and
+ships it. To refresh the DLL, rebuild it in the [SQUISH] repo (`make dll` or
+`build-windows.bat`) and copy `squish.dll`, `squish.lib`, and `squish.h` into
+`squish\`.
 
 ## Installer
 
@@ -55,7 +68,8 @@ installer\build-installer.bat
 
 Produces `build\winsquish-setup.exe`, a per-user installer (requires
 [Inno Setup](https://jrsoftware.org/isdl.php) 6.3+; it builds
-`winsquish.exe` first if needed). The installer needs **no administrator
+`winsquish.exe` first if needed). It installs both `winsquish.exe` and its
+`squish.dll` dependency. The installer needs **no administrator
 rights** — it installs into `%LOCALAPPDATA%\Programs\WinSquish`, registers
 the `.sq` file type and Explorer context-menu entries under `HKCU`, adds a
 Start Menu shortcut, and creates an Add/Remove Programs entry. Registration
@@ -67,9 +81,10 @@ WinSquish) before removing the files.
 ## Command line
 
 ```
-winsquish.exe [file]                open GUI with the file preloaded
-winsquish.exe --compress <file>     open GUI and start compressing to .sq
-winsquish.exe --compress-sfx <file> open GUI and build a self-extracting .exe
+winsquish.exe [path]                open GUI with the file/folder preloaded
+winsquish.exe --compress <path>     open GUI and start compressing to .sq
+                                    (<path> may be a file or a folder)
+winsquish.exe --compress-sfx <path> open GUI and build a self-extracting .exe
 winsquish.exe --decompress <file>   open GUI and extract a .sq or an SFX
 winsquish.exe --register            install the context-menu entries (HKCU)
 winsquish.exe --unregister          remove them
@@ -96,8 +111,9 @@ time of registration — re-register after moving the exe.
 ```
 src\winsquish.cpp    the application (pure Win32, no MFC/ATL)
 src\winsquish.rc     icon, version info, manifest
-squish\              vendored libsquish (squish.c / squish.h), unmodified
-build.bat            one-step MSVC build
+squish\              libsquish SDK: squish.h + squish.lib (import lib) +
+                     squish.dll (linked at run time, shipped in the installer)
+build.bat            one-step MSVC build (links the DLL, copies it to build\)
 installer\           Inno Setup script + one-step installer build
 ```
 

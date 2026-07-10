@@ -56,10 +56,13 @@
 #include <windowsx.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <string>
 #include <string.h>
+#include <vector>
+#include <algorithm>
 
 #include "../squish/squish.h"
 #include "resource.h"
@@ -68,6 +71,7 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "ole32.lib")
 
 /* --- constants ------------------------------------------------------------ */
 static const wchar_t *APP_NAME   = L"WinSquish";
@@ -95,6 +99,7 @@ static const wchar_t *SQ_EXT     = L".sq";
 #define IDM_REGISTER     2003
 #define IDM_UNREGISTER   2004
 #define IDM_ABOUT        2005
+#define IDM_OPENFOLDER   2006
 
 /* --- globals ---------------------------------------------------------------*/
 static HWND      g_hwnd;
@@ -107,6 +112,7 @@ struct Job {
     std::wstring src, dst;
     bool         compress;   /* true = compress, false = extract              */
     bool         sfx;        /* compress: build .exe SFX; extract: src is SFX */
+    bool         srcIsDir;   /* compress: source is a folder (SQAR archive)   */
     int          threads;    /* worker count; 1 = single-block (best ratio)   */
     volatile LONG lastPct;
 };
@@ -388,6 +394,279 @@ static int WriteSfx(uint64_t stubLen, const std::wstring &payloadPath,
     return rc;
 }
 
+/* --- directory archive "SQAR" (matches the squish CLI, docs FORMAT.md §12) --
+ * A directory is not compressed directly: its whole tree is first serialized
+ * into a single "SQAR" byte stream (built below), which is then handed to the
+ * ordinary buffer compressor — so libsquish never has to know about files or
+ * directories. On extraction we decompress to a buffer and, if it begins with
+ * the SQAR magic, unpack the tree; otherwise the buffer is a single file and
+ * is written verbatim (byte-for-byte compatible with pre-directory streams).
+ *
+ * Layout (all integers little-endian). Header:
+ *     magic[8]="SQAR01\n\x1a" | version u32 (1) | flags u32 (0) | count u64
+ * then `count` entries, each:
+ *     type u8 (0=file,1=dir) | mode u32 | path_len u32 | data_len u64 |
+ *     path[path_len] (relative, '/'-separated, UTF-8) | data[data_len]
+ * Directories carry data_len 0 and are emitted before their contents (so empty
+ * ones survive); siblings are stored sorted by name, so the archive depends
+ * only on the tree, not on directory-iteration order. The whole layout is
+ * identical to the CLI's, so folder archives interoperate in both directions. */
+static const unsigned char SQAR_MAGIC[8] =
+    { 'S','Q','A','R','0','1','\n','\x1a' };
+#define SQAR_VERSION  1u
+#define SQAR_HDR_LEN  24u             /* magic8 + version4 + flags4 + count8 */
+#define SQAR_ENT_LEN  17u             /* type1 + mode4 + plen4 + dlen8       */
+#define SQAR_MAX_PATH 65535u
+
+/* UTF-8 (n bytes) -> wide. */
+static std::wstring FromUtf8(const char *s, int n) {
+    if (n <= 0) return std::wstring();
+    int w = MultiByteToWideChar(CP_UTF8, 0, s, n, nullptr, 0);
+    if (w <= 0) return std::wstring();
+    std::wstring r(w, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s, n, &r[0], w);
+    return r;
+}
+
+static bool IsDirectory(const std::wstring &p) {
+    DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+/* Read an entire file into `out`. false on open/read failure or if it does not
+ * fit in memory (size_t). */
+static bool ReadWholeFile(const std::wstring &path, std::string *out) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN,
+                           nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER li;
+    if (!GetFileSizeEx(h, &li) || li.QuadPart < 0 ||
+        (unsigned long long)li.QuadPart > (size_t)-1) { CloseHandle(h); return false; }
+    out->resize((size_t)li.QuadPart);
+    size_t left = out->size(), off = 0;
+    bool ok = true;
+    while (left) {
+        DWORD want = (DWORD)(left < (1u << 20) ? left : (1u << 20)), got = 0;
+        if (!ReadFile(h, &(*out)[off], want, &got, nullptr) || got == 0) { ok = false; break; }
+        off += got; left -= got;
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+/* Read [off, off+len) of `path` into `out`. */
+static bool ReadRange(const std::wstring &path, uint64_t off, uint64_t len,
+                      std::string *out) {
+    if (len > (size_t)-1) return false;
+    HANDLE h = OpenShared(path);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER pos; pos.QuadPart = (long long)off;
+    if (!SetFilePointerEx(h, pos, nullptr, FILE_BEGIN)) { CloseHandle(h); return false; }
+    out->resize((size_t)len);
+    size_t leftb = (size_t)len, o = 0;
+    bool ok = true;
+    while (leftb) {
+        DWORD want = (DWORD)(leftb < (1u << 20) ? leftb : (1u << 20)), got = 0;
+        if (!ReadFile(h, &(*out)[o], want, &got, nullptr) || got == 0) { ok = false; break; }
+        o += got; leftb -= got;
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+/* Write `len` bytes to `path` (overwriting). 0 on success, -1 on failure (the
+ * partial file is removed). */
+static int WriteWholeFile(const std::wstring &path, const void *data, size_t len) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    const unsigned char *p = (const unsigned char *)data;
+    size_t left = len;
+    bool ok = true;
+    while (left) {
+        DWORD want = (DWORD)(left < (1u << 20) ? left : (1u << 20)), wr = 0;
+        if (!WriteFile(h, p, want, &wr, nullptr) || wr == 0) { ok = false; break; }
+        p += wr; left -= wr;
+    }
+    CloseHandle(h);
+    if (!ok) DeleteFileW(path.c_str());
+    return ok ? 0 : -1;
+}
+
+/* Create `path` and every missing parent directory. Absolute paths only.
+ * Returns true once `path` exists as a directory. */
+static bool MakeDirTree(const std::wstring &path) {
+    if (path.empty()) return false;
+    for (size_t i = 1; i < path.size(); i++)
+        if (path[i] == L'\\' || path[i] == L'/') {
+            std::wstring sub = path.substr(0, i);
+            CreateDirectoryW(sub.c_str(), nullptr);   /* ignore "already exists" */
+        }
+    CreateDirectoryW(path.c_str(), nullptr);
+    return IsDirectory(path);
+}
+
+/* A growable byte buffer + running entry count for building an archive.
+ * (Named ArcBuf, not Arc — the Win32 GDI Arc() function would hide the tag.) */
+struct ArcBuf { std::string buf; uint64_t count = 0; };
+static void ArcU8 (ArcBuf &a, unsigned char v) { a.buf.push_back((char)v); }
+static void ArcU32(ArcBuf &a, uint32_t v) {
+    unsigned char t[4]; PutU32LE(t, v); a.buf.append((const char *)t, 4);
+}
+static void ArcU64(ArcBuf &a, uint64_t v) {
+    unsigned char t[8]; PutU64LE(t, v); a.buf.append((const char *)t, 8);
+}
+
+/* Names inside `dir` (excluding "." and ".."), each with its UTF-8 form,
+ * sorted by the UTF-8 bytes so archives are reproducible and match the CLI. */
+struct DirEnt { std::wstring w; std::string u8; };
+static bool ListDirSorted(const std::wstring &dir, std::vector<DirEnt> *out) {
+    out->clear();
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return GetLastError() == ERROR_FILE_NOT_FOUND;     /* empty dir is ok */
+    do {
+        const wchar_t *nm = fd.cFileName;
+        if (!wcscmp(nm, L".") || !wcscmp(nm, L"..")) continue;
+        out->push_back({ nm, ToUtf8(nm) });
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(out->begin(), out->end(), [](const DirEnt &a, const DirEnt &b) {
+        size_t n = a.u8.size() < b.u8.size() ? a.u8.size() : b.u8.size();
+        int c = memcmp(a.u8.data(), b.u8.data(), n);   /* unsigned, like strcmp */
+        return c ? c < 0 : a.u8.size() < b.u8.size();
+    });
+    return true;
+}
+
+static bool ArcAddContents(ArcBuf &a, const std::wstring &fsDir,
+                           const std::string &arcPrefix);
+
+/* Append one filesystem item `fs` to the archive under the archive-relative
+ * path `arcRel` (its full '/'-separated path from the archive root). */
+static bool ArcAddItem(ArcBuf &a, const std::wstring &fs, const std::string &arcRel) {
+    if (arcRel.empty() || arcRel.size() > SQAR_MAX_PATH) return false;
+    if (IsDirectory(fs)) {
+        ArcU8(a, 1); ArcU32(a, 0755);
+        ArcU32(a, (uint32_t)arcRel.size()); ArcU64(a, 0);
+        a.buf.append(arcRel);
+        a.count++;
+        return ArcAddContents(a, fs, arcRel);
+    }
+    std::string data;
+    if (!ReadWholeFile(fs, &data)) return false;
+    ArcU8(a, 0); ArcU32(a, 0644);
+    ArcU32(a, (uint32_t)arcRel.size()); ArcU64(a, (uint64_t)data.size());
+    a.buf.append(arcRel);
+    a.buf.append(data);
+    a.count++;
+    return true;
+}
+
+/* Append every child of `fsDir` (sorted). arcPrefix is the archive path of
+ * fsDir ("" at the top level, so top-level entries are the folder's contents). */
+static bool ArcAddContents(ArcBuf &a, const std::wstring &fsDir,
+                           const std::string &arcPrefix) {
+    std::vector<DirEnt> names;
+    if (!ListDirSorted(fsDir, &names)) return false;
+    for (const DirEnt &e : names) {
+        std::string arc = arcPrefix.empty() ? e.u8 : arcPrefix + "/" + e.u8;
+        if (!ArcAddItem(a, fsDir + L"\\" + e.w, arc)) return false;
+    }
+    return true;
+}
+
+/* Serialize directory `dir` into a fresh SQAR buffer. */
+static bool BuildArchive(const std::wstring &dir, std::string *out,
+                         uint64_t *entries) {
+    ArcBuf a;
+    a.buf.append((const char *)SQAR_MAGIC, 8);
+    ArcU32(a, SQAR_VERSION); ArcU32(a, 0); ArcU64(a, 0);   /* count patched below */
+    if (!ArcAddContents(a, dir, "")) return false;
+    PutU64LE((unsigned char *)&a.buf[16], a.count);
+    if (entries) *entries = a.count;
+    *out = std::move(a.buf);
+    return true;
+}
+
+/* True if `buf` looks like a serialized archive (magic + known version). */
+static bool IsArchive(const void *buf, size_t len) {
+    return len >= SQAR_HDR_LEN && memcmp(buf, SQAR_MAGIC, 8) == 0 &&
+           GetU32LE((const unsigned char *)buf + 8) == SQAR_VERSION;
+}
+
+/* A stored path is safe iff it is relative and every component is non-empty,
+ * not "." or "..", and free of '\\', ':' and NUL — so an archive can never
+ * write outside the extraction root. Mirrors the CLI's arc_path_safe. */
+static bool ArcPathSafe(const char *p, size_t n) {
+    if (n == 0 || p[0] == '/') return false;
+    for (size_t i = 0; i < n; ) {
+        size_t j = i;
+        while (j < n && p[j] != '/') j++;
+        size_t clen = j - i;
+        if (clen == 0) return false;
+        if (clen == 1 && p[i] == '.') return false;
+        if (clen == 2 && p[i] == '.' && p[i + 1] == '.') return false;
+        for (size_t k = i; k < j; k++) {
+            unsigned char c = (unsigned char)p[k];
+            if (c == '\\' || c == ':' || c == '\0') return false;
+        }
+        i = (j < n) ? j + 1 : j;
+    }
+    return true;
+}
+
+/* Unpack a validated SQAR buffer into directory `outRoot` (created if needed).
+ * Every length and path is bounds-checked and traversal-guarded; a malformed
+ * archive returns SQUISH_E_FORMAT, an I/O failure SQUISH_E_IO. */
+static int UnpackArchive(const unsigned char *b, size_t len,
+                         const std::wstring &outRoot, uint64_t *nfiles,
+                         uint64_t *nbytes) {
+    if (!IsArchive(b, len)) return SQUISH_E_FORMAT;
+    uint64_t count = GetU64LE(b + 16);
+    size_t off = SQAR_HDR_LEN;
+    uint64_t files = 0, bytes = 0;
+    if (!MakeDirTree(outRoot)) return SQUISH_E_IO;
+
+    for (uint64_t i = 0; i < count; i++) {
+        if (len - off < SQAR_ENT_LEN) return SQUISH_E_FORMAT;
+        unsigned char type = b[off];
+        uint32_t plen = GetU32LE(b + off + 5);
+        uint64_t dlen = GetU64LE(b + off + 9);
+        off += SQAR_ENT_LEN;
+        if (plen == 0 || plen > SQAR_MAX_PATH || plen > len - off)
+            return SQUISH_E_FORMAT;
+        const char *path = (const char *)(b + off);
+        if (!ArcPathSafe(path, plen)) return SQUISH_E_FORMAT;
+        std::wstring rel = FromUtf8(path, (int)plen);
+        for (wchar_t &c : rel) if (c == L'/') c = L'\\';
+        off += plen;
+        std::wstring full = outRoot + L"\\" + rel;
+
+        if (type == 1) {                                   /* directory */
+            if (dlen != 0) return SQUISH_E_FORMAT;
+            if (!MakeDirTree(full)) return SQUISH_E_IO;
+        } else if (type == 0) {                            /* regular file */
+            if (dlen > len - off) return SQUISH_E_FORMAT;
+            size_t s = full.find_last_of(L'\\');
+            if (s != std::wstring::npos && !MakeDirTree(full.substr(0, s)))
+                return SQUISH_E_IO;
+            if (WriteWholeFile(full, b + off, (size_t)dlen) != 0)
+                return SQUISH_E_IO;
+            off += (size_t)dlen;
+            files++; bytes += dlen;
+        } else {
+            return SQUISH_E_FORMAT;
+        }
+    }
+    if (off != len) return SQUISH_E_FORMAT;                /* entries must tile */
+    if (nfiles) *nfiles = files;
+    if (nbytes) *nbytes = bytes;
+    return SQUISH_OK;
+}
+
 /* --- context-menu registration (HKCU\Software\Classes, no admin) -----------*/
 static bool SetRegValue(const std::wstring &key, const wchar_t *name,
                         const std::wstring &val) {
@@ -420,6 +699,21 @@ static bool RegisterShell(void) {
     ok &= SetRegValue(ksfx + L"\\command", nullptr,
                       quoted + L" --compress-sfx \"%1\"");
 
+    /* The same two verbs on folders (right-click a directory): the whole tree
+     * is packed into a single SQAR archive stream. */
+    std::wstring kd = L"Software\\Classes\\Directory\\shell\\WinSquish.Compress";
+    ok &= SetRegValue(kd, nullptr, L"Compress to .sq (WinSquish)");
+    ok &= SetRegValue(kd, L"Icon", quoted);
+    ok &= SetRegValue(kd + L"\\command", nullptr, quoted + L" --compress \"%1\"");
+
+    std::wstring kdsfx =
+        L"Software\\Classes\\Directory\\shell\\WinSquish.CompressSfx";
+    ok &= SetRegValue(kdsfx, nullptr,
+                      L"Compress to self-extracting .exe (WinSquish)");
+    ok &= SetRegValue(kdsfx, L"Icon", quoted);
+    ok &= SetRegValue(kdsfx + L"\\command", nullptr,
+                      quoted + L" --compress-sfx \"%1\"");
+
     /* .sq extension -> ProgID */
     ok &= SetRegValue(L"Software\\Classes\\" + std::wstring(SQ_EXT),
                       nullptr, PROGID);
@@ -446,6 +740,10 @@ static void UnregisterShell(void) {
     RegDeleteTreeW(HKEY_CURRENT_USER,
                    L"Software\\Classes\\*\\shell\\WinSquish.CompressSfx");
     RegDeleteTreeW(HKEY_CURRENT_USER,
+                   L"Software\\Classes\\Directory\\shell\\WinSquish.Compress");
+    RegDeleteTreeW(HKEY_CURRENT_USER,
+                   L"Software\\Classes\\Directory\\shell\\WinSquish.CompressSfx");
+    RegDeleteTreeW(HKEY_CURRENT_USER,
                    (L"Software\\Classes\\" + std::wstring(PROGID)).c_str());
     /* remove the extension mapping only if it still points at us */
     HKEY hk;
@@ -470,18 +768,53 @@ static void SquishProgress(uint64_t done, uint64_t total, void *user) {
         PostMessageW(job->hwnd, WM_APP_PROGRESS, (WPARAM)pct, 0);
 }
 
-/* Build job->dst as a self-extracting .exe: compress the source to a scratch
- * SQUISH stream (progress is reported over this, the slow part), then splice
- * [stub][payload][name][trailer] into the output. */
+/* Compress job->src to a plain SQUISH stream at `outPath`. A directory is
+ * serialized into an SQAR archive first, then compressed as one buffer; a file
+ * is streamed straight through the file helpers (no in-memory copy). */
+static int CompressToStream(Job *job, const std::wstring &outPath) {
+    if (IsDirectory(job->src)) {
+        std::string blob;
+        if (!BuildArchive(job->src, &blob, nullptr)) return SQUISH_E_IO;
+        void *comp = nullptr; size_t clen = 0;
+        int rc = squish_compress_alloc_mt(blob.data(), blob.size(), &comp, &clen,
+                                          job->threads, 0, SquishProgress, job);
+        if (rc != SQUISH_OK) return rc;
+        int wr = WriteWholeFile(outPath, comp, clen);
+        squish_free(comp);
+        return wr == 0 ? SQUISH_OK : SQUISH_E_IO;
+    }
+    std::string src = ToUtf8(job->src), out = ToUtf8(outPath);
+    return job->threads > 1
+         ? squish_compress_file_mt(src.c_str(), out.c_str(), job->threads, 0,
+                                   SquishProgress, job)
+         : squish_compress_file2(src.c_str(), out.c_str(), SquishProgress, job);
+}
+
+/* Decompress a whole compressed stream held in memory and write the result to
+ * job->dst: a directory tree when the payload is an SQAR archive, otherwise a
+ * single file. Used for both plain .sq streams and SFX payloads. */
+static int ExtractStream(Job *job, const unsigned char *comp, size_t clen) {
+    void *raw = nullptr; size_t rn = 0;
+    int rc = squish_decompress_alloc_mt(comp, clen, &raw, &rn, job->threads,
+                                        SquishProgress, job);
+    if (rc != SQUISH_OK) return rc;
+    if (IsArchive(raw, rn)) {
+        uint64_t nf = 0, nb = 0;
+        rc = UnpackArchive((const unsigned char *)raw, rn, job->dst, &nf, &nb);
+    } else {
+        rc = WriteWholeFile(job->dst, raw, rn) == 0 ? SQUISH_OK : SQUISH_E_IO;
+    }
+    squish_free(raw);
+    return rc;
+}
+
+/* Build job->dst as a self-extracting .exe: compress the source (file or
+ * directory) to a scratch SQUISH stream (progress is reported over this, the
+ * slow part), then splice [stub][payload][name][trailer] into the output. */
 static int SfxCompress(Job *job) {
     std::wstring tmp = MakeTempPath();
     if (tmp.empty()) return SQUISH_E_IO;
-    std::string src = ToUtf8(job->src), tmpU = ToUtf8(tmp);
-    int rc = job->threads > 1
-           ? squish_compress_file_mt(src.c_str(), tmpU.c_str(), job->threads, 0,
-                                     SquishProgress, job)
-           : squish_compress_file2(src.c_str(), tmpU.c_str(),
-                                   SquishProgress, job);
+    int rc = CompressToStream(job, tmp);
     if (rc != SQUISH_OK) { DeleteFileW(tmp.c_str()); return rc; }
 
     uint64_t stubLen = 0;
@@ -498,48 +831,29 @@ static int SfxCompress(Job *job) {
 }
 
 /* Extract the payload of an SFX (job->src, any platform's stub) to job->dst:
- * copy the payload region to a scratch stream, then decompress it. */
+ * read the payload region into memory, then decompress + unpack it. */
 static int SfxExtract(Job *job) {
     SfxInfo info;
     if (!ProbeSfx(job->src, &info)) return SQUISH_E_FORMAT;
-    std::wstring tmp = MakeTempPath();
-    if (tmp.empty()) return SQUISH_E_IO;
-
-    HANDLE in = OpenShared(job->src);
-    if (in == INVALID_HANDLE_VALUE) { DeleteFileW(tmp.c_str()); return SQUISH_E_IO; }
-    HANDLE out = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
-                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (out == INVALID_HANDLE_VALUE) {
-        CloseHandle(in); DeleteFileW(tmp.c_str()); return SQUISH_E_IO;
-    }
-    bool ok = CopyRange(in, out, info.payloadOff, info.payloadLen);
-    CloseHandle(in); CloseHandle(out);
-    if (!ok) { DeleteFileW(tmp.c_str()); return SQUISH_E_IO; }
-
-    std::string tmpU = ToUtf8(tmp), dst = ToUtf8(job->dst);
-    int rc = squish_decompress_file_mt(tmpU.c_str(), dst.c_str(), job->threads,
-                                       SquishProgress, job);
-    DeleteFileW(tmp.c_str());
-    return rc;
+    std::string payload;
+    if (!ReadRange(job->src, info.payloadOff, info.payloadLen, &payload))
+        return SQUISH_E_IO;
+    return ExtractStream(job, (const unsigned char *)payload.data(),
+                         payload.size());
 }
 
 static DWORD WINAPI WorkerProc(LPVOID param) {
     Job *job = (Job *)param;
-    std::string src = ToUtf8(job->src), dst = ToUtf8(job->dst);
     int rc;
     if (job->compress) {
-        rc = job->sfx
-           ? SfxCompress(job)
-           : job->threads > 1
-              ? squish_compress_file_mt(src.c_str(), dst.c_str(), job->threads,
-                                        0, SquishProgress, job)
-              : squish_compress_file2(src.c_str(), dst.c_str(),
-                                      SquishProgress, job);
+        rc = job->sfx ? SfxCompress(job) : CompressToStream(job, job->dst);
+    } else if (job->sfx) {
+        rc = SfxExtract(job);
     } else {
-        rc = job->sfx
-           ? SfxExtract(job)
-           : squish_decompress_file_mt(src.c_str(), dst.c_str(), job->threads,
-                                       SquishProgress, job);
+        std::string comp;
+        rc = ReadWholeFile(job->src, &comp)
+           ? ExtractStream(job, (const unsigned char *)comp.data(), comp.size())
+           : SQUISH_E_IO;
     }
     PostMessageW(job->hwnd, WM_APP_DONE, (WPARAM)rc, 0);
     return 0;
@@ -563,9 +877,22 @@ static void UpdateFileInfo(void) {
     GetDlgItemTextW(g_hwnd, IDC_FILE_EDIT, path, MAX_PATH);
     if (!path[0]) { SetDlgItemTextW(g_hwnd, IDC_INFO_STATIC, L""); return; }
 
+    /* A folder is packed into a single SQAR archive stream before compression. */
+    if (IsDirectory(path)) {
+        bool sfxMode = IsDlgButtonChecked(g_hwnd, IDC_SFX_CHECK) == BST_CHECKED;
+        std::wstring out = sfxMode ? SfxOutputPath(path)
+                                   : std::wstring(path) + SQ_EXT;
+        std::wstring info = L"folder  —  will pack + " +
+                std::wstring(sfxMode ? L"build" : L"compress to") +
+                L" \"" + Basename(out) + L"\"";
+        SetDefaultButton(false);
+        SetDlgItemTextW(g_hwnd, IDC_INFO_STATIC, info.c_str());
+        return;
+    }
+
     long long n = FileSize(path);
     if (n < 0) {
-        SetDlgItemTextW(g_hwnd, IDC_INFO_STATIC, L"File not found.");
+        SetDlgItemTextW(g_hwnd, IDC_INFO_STATIC, L"File or folder not found.");
         return;
     }
     std::wstring info = PrettySize(n);
@@ -628,13 +955,20 @@ static void StartJob(bool compress) {
     GetDlgItemTextW(g_hwnd, IDC_FILE_EDIT, buf, MAX_PATH);
     std::wstring src = buf;
     if (src.empty()) {
-        MessageBoxW(g_hwnd, L"Choose a file first.", APP_NAME,
+        MessageBoxW(g_hwnd, L"Choose a file or folder first.", APP_NAME,
                     MB_ICONINFORMATION);
         return;
     }
-    if (FileSize(src) < 0) {
+    bool srcIsDir = IsDirectory(src);
+    if (!srcIsDir && FileSize(src) < 0) {
         MessageBoxW(g_hwnd, (L"File not found:\n" + src).c_str(), APP_NAME,
                     MB_ICONERROR);
+        return;
+    }
+    if (srcIsDir && !compress) {
+        MessageBoxW(g_hwnd, L"A folder can be compressed, but not extracted.\n"
+                            L"Choose a .sq stream or self-extracting archive to "
+                            L"extract.", APP_NAME, MB_ICONINFORMATION);
         return;
     }
 
@@ -677,7 +1011,8 @@ static void StartJob(bool compress) {
             return;
     }
 
-    g_job = new Job{ g_hwnd, src, dst, compress, sfx, SelectedThreads(), -1 };
+    g_job = new Job{ g_hwnd, src, dst, compress, sfx, srcIsDir,
+                     SelectedThreads(), -1 };
     g_t0 = GetTickCount64();
     SetBusy(true);
     SetStatus(compress ? (sfx ? L"Building self-extracting archive…"
@@ -708,16 +1043,33 @@ static void OnJobDone(int rc) {
                     APP_NAME, MB_ICONERROR);
     } else {
         long long in = FileSize(job->src), out = FileSize(job->dst);
+        bool outIsDir = IsDirectory(job->dst);
         wchar_t msg[512];
         if (job->compress && job->sfx) {
-            swprintf(msg, 512,
-                     L"Done in %.1f s — self-extracting archive %s → %s",
-                     secs, PrettySize(in).c_str(), PrettySize(out).c_str());
+            if (job->srcIsDir)
+                swprintf(msg, 512,
+                         L"Done in %.1f s — folder → self-extracting archive %s",
+                         secs, PrettySize(out).c_str());
+            else
+                swprintf(msg, 512,
+                         L"Done in %.1f s — self-extracting archive %s → %s",
+                         secs, PrettySize(in).c_str(), PrettySize(out).c_str());
         } else if (job->compress) {
-            double ratio = (in > 0 && out > 0) ? 100.0 * out / in : 0;
-            swprintf(msg, 512, L"Done in %.1f s — %s → %s (%.1f%% of original)",
-                     secs, PrettySize(in).c_str(), PrettySize(out).c_str(),
-                     ratio);
+            if (job->srcIsDir)
+                swprintf(msg, 512,
+                         L"Done in %.1f s — folder packed + compressed to %s (%s)",
+                         secs, Basename(job->dst).c_str(), PrettySize(out).c_str());
+            else {
+                double ratio = (in > 0 && out > 0) ? 100.0 * out / in : 0;
+                swprintf(msg, 512,
+                         L"Done in %.1f s — %s → %s (%.1f%% of original)",
+                         secs, PrettySize(in).c_str(), PrettySize(out).c_str(),
+                         ratio);
+            }
+        } else if (outIsDir) {
+            swprintf(msg, 512,
+                     L"Done in %.1f s — extracted folder \"%s\" (checksum OK)",
+                     secs, Basename(job->dst).c_str());
         } else {
             swprintf(msg, 512, L"Done in %.1f s — extracted %s (checksum OK)",
                      secs, PrettySize(out).c_str());
@@ -743,6 +1095,30 @@ static void BrowseFile(void) {
         SetDlgItemTextW(g_hwnd, IDC_FILE_EDIT, buf);
         UpdateFileInfo();
     }
+}
+
+/* Pick a folder to compress (IFileOpenDialog in pick-folders mode). */
+static void BrowseFolder(void) {
+    IFileOpenDialog *dlg = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))))
+        return;
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    if (SUCCEEDED(dlg->Show(g_hwnd))) {
+        IShellItem *item = nullptr;
+        if (SUCCEEDED(dlg->GetResult(&item))) {
+            PWSTR path = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                SetDlgItemTextW(g_hwnd, IDC_FILE_EDIT, path);
+                UpdateFileInfo();
+                CoTaskMemFree(path);
+            }
+            item->Release();
+        }
+    }
+    dlg->Release();
 }
 
 static HRESULT CALLBACK AboutCallback(HWND, UINT notification, WPARAM,
@@ -796,7 +1172,7 @@ static void CreateControls(HWND hwnd) {
                                   48, 12, 340, 24, IDC_FILE_EDIT },
         { L"BUTTON",   L"Browse…", ES | WS_TABSTOP,
                                   396, 11, 80, 26, IDC_BROWSE_BTN },
-        { L"STATIC",   L"Drop a file here, or Browse.", ES,
+        { L"STATIC",   L"Drop a file or folder here, or use File ▸ Open.", ES,
                                   12, 44, 464, 20, IDC_INFO_STATIC },
         { L"STATIC",   L"CPU cores:", ES | SS_CENTERIMAGE,
                                   12, 68, 66, 22, 0 },
@@ -841,7 +1217,8 @@ static void CreateControls(HWND hwnd) {
 
 static HMENU BuildMenu(void) {
     HMENU file = CreatePopupMenu();
-    AppendMenuW(file, MF_STRING, IDM_OPEN, L"&Open…\tCtrl+O");
+    AppendMenuW(file, MF_STRING, IDM_OPEN, L"&Open file…\tCtrl+O");
+    AppendMenuW(file, MF_STRING, IDM_OPENFOLDER, L"Open &folder…");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, IDM_EXIT, L"E&xit");
     HMENU tools = CreatePopupMenu();
@@ -881,6 +1258,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(wp)) {
         case IDC_BROWSE_BTN:
         case IDM_OPEN:         BrowseFile();                       return 0;
+        case IDM_OPENFOLDER:   BrowseFolder();                     return 0;
         case IDC_COMPRESS_BTN: StartJob(true);                     return 0;
         case IDC_EXTRACT_BTN:  StartJob(false);                    return 0;
         case IDC_SFX_CHECK:
@@ -984,6 +1362,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
         SfxInfo selfInfo;
         if (ProbeSfx(ExePath(), &selfInfo)) { file = ExePath(); autoMode = 2; }
     }
+
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_PROGRESS_CLASS };
     InitCommonControlsEx(&icc);

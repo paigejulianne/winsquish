@@ -80,6 +80,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\build\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+; libsquish, linked at run time by winsquish.exe. Shipped from the vendored
+; copy (squish\squish.dll), which is always present, and installed beside the
+; exe so the loader finds it.
+Source: "..\squish\squish.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE";         DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 Source: "..\README.md";       DestDir: "{app}"; Flags: ignoreversion
 

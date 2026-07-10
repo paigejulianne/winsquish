@@ -36,10 +36,19 @@ if not exist build mkdir build
 rc /nologo /fo build\winsquish.res src\winsquish.rc
 if errorlevel 1 exit /b 1
 
-cl /nologo /O2 /W4 /MT /utf-8 /DUNICODE /D_UNICODE /EHsc /Isquish ^
+rem Link against the prebuilt libsquish DLL (squish\squish.lib is its import
+rem library; squish\squish.dll ships beside the exe and in the installer). We
+rem no longer compile squish.c in -- /DSQUISH_DLL makes squish.h declare the API
+rem as __declspec(dllimport).
+cl /nologo /O2 /W4 /MT /utf-8 /DUNICODE /D_UNICODE /DSQUISH_DLL /EHsc /Isquish ^
    /Fo:build\ /Fe:build\winsquish.exe ^
-   src\winsquish.cpp squish\squish.c build\winsquish.res ^
-   /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib
+   src\winsquish.cpp build\winsquish.res ^
+   /link /SUBSYSTEM:WINDOWS squish\squish.lib user32.lib gdi32.lib
+if errorlevel 1 exit /b 1
+
+rem The exe needs squish.dll at run time; keep a copy in build\ so it runs
+rem straight from there (the installer ships the DLL alongside the exe too).
+copy /y squish\squish.dll build\squish.dll >nul
 if errorlevel 1 exit /b 1
 
 rem --- Authenticode signing via Azure Trusted Signing (optional) -------------
