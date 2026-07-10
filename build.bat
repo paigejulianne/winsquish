@@ -36,7 +36,7 @@ if not exist build mkdir build
 rc /nologo /fo build\winsquish.res src\winsquish.rc
 if errorlevel 1 exit /b 1
 
-cl /nologo /O2 /W4 /MT /DUNICODE /D_UNICODE /EHsc /Isquish ^
+cl /nologo /O2 /W4 /MT /utf-8 /DUNICODE /D_UNICODE /EHsc /Isquish ^
    /Fo:build\ /Fe:build\winsquish.exe ^
    src\winsquish.cpp squish\squish.c build\winsquish.res ^
    /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib
