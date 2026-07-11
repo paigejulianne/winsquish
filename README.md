@@ -33,6 +33,9 @@ context-mixing compressor, with Explorer right-click integration.
   inflated on demand by seeking straight to its own stream, so pulling a few
   files out of a huge archive never decompresses the whole thing. Overwriting
   an existing file is confirmed first (with an "apply to all" option).
+  Directory archives written by *older* WinSquish builds (a solid `SQAR01`
+  stream, no random access) still browse and extract too — they're decompressed
+  whole first (with a progress bar), then presented the same way.
 - **Self-extracting archives (SFX)**: tick **Create self-extracting archive**
   and Compress produces a Windows `.exe` instead of a `.sq` — WinSquish itself
   is the stub, so double-clicking that `.exe` extracts the payload beside it,
