@@ -17,11 +17,13 @@
 /* ============================================================================
  * winsquish.cpp — Windows GUI front end for libsquish
  *
- * A small WinRAR-style utility: pick (or drop) a file, compress it to .sq or
- * extract a .sq stream, with live progress. "View Files…" opens an archive in
- * a browsable window — navigate its folders and extract just the files or
- * folders you select, WinRAR-style. Installs optional per-user Explorer
- * context-menu entries:
+ * A WinZip/PeaZip-style archive manager built on one large, resizable window:
+ * a toolbar (Open, Compress, Extract, Up), an address bar, a central file list,
+ * and a status bar. Open a .sq or self-extracting archive to browse its folders
+ * in the list and extract just the files or folders you select; Compress packs
+ * a file or folder into a new .sq (or a .exe SFX) with live progress, then opens
+ * the result. Files, folders, and archives can also be dropped onto the window.
+ * Installs optional per-user Explorer context-menu entries:
  *
  *   any file  ->  "Compress to .sq (WinSquish)"
  *   any file  ->  "Compress to self-extracting .exe (WinSquish)"
@@ -41,11 +43,12 @@
  *   platform-specific; opening a foreign SFX in WinSquish always works.
  *
  * Command line:
- *   winsquish.exe [file]                 open GUI, file preloaded
+ *   winsquish.exe [file]                 open GUI (browse an archive, else queue
+ *                                        the file for compression)
  *   winsquish.exe --compress <file>      open GUI and start compressing (.sq)
  *   winsquish.exe --compress-sfx <file>  open GUI and build a .exe SFX
- *   winsquish.exe --decompress <file>    open GUI and extract (.sq or SFX)
- *   winsquish.exe --view <file>          open the archive browser (.sq or SFX)
+ *   winsquish.exe --decompress <file>    open GUI and extract to disk (.sq/SFX)
+ *   winsquish.exe --view <file>          open GUI and browse the archive
  *   winsquish.exe --register             install context-menu entries (HKCU)
  *   winsquish.exe --unregister           remove them
  *   winsquish.exe --register --quiet     as above, but no confirmation dialog
@@ -62,6 +65,8 @@
 #include <shobjidl.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <objidl.h>
+#include <gdiplus.h>
 #include <string>
 #include <string.h>
 #include <vector>
@@ -75,6 +80,7 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "ole32.lib")
 
 /* --- constants ------------------------------------------------------------ */
@@ -86,38 +92,50 @@ static const wchar_t *SQ_EXT     = L".sq";
 #define WM_APP_PROGRESS (WM_APP + 1)   /* wParam = percent 0..100            */
 #define WM_APP_DONE     (WM_APP + 2)   /* wParam = squish_status              */
 
-/* control IDs */
-#define IDC_FILE_EDIT    1001
-#define IDC_BROWSE_BTN   1002
-#define IDC_INFO_STATIC  1003
+/* main-window control IDs */
 #define IDC_CPU_COMBO    1004
-#define IDC_COMPRESS_BTN 1005
-#define IDC_EXTRACT_BTN  1006
 #define IDC_PROGRESS     1007
-#define IDC_STATUS       1008
 #define IDC_SFX_CHECK    1009
-#define IDC_VIEW_BTN     1010
+#define IDC_TOOLBAR      1020
+#define IDC_STATUSBAR    1021
+#define IDC_HINT         1022
+#define IDC_LOC_LABEL    1023
+#define IDC_CPU_LABEL    1024
 
-/* archive-browser window control IDs */
+/* file-list / address-bar control IDs */
 #define IDC_LV           1101
-#define IDC_UP_BTN       1102
-#define IDC_EXTRACT_SEL  1103
-#define IDC_EXTRACT_ALL  1104
 #define IDC_PATH_STATIC  1105
 
-/* menu IDs */
-#define IDM_OPEN         2001
-#define IDM_EXIT         2002
-#define IDM_REGISTER     2003
-#define IDM_UNREGISTER   2004
-#define IDM_ABOUT        2005
-#define IDM_OPENFOLDER   2006
+/* command IDs — menu items and toolbar buttons share the WM_COMMAND space */
+#define IDM_OPEN            2001   /* open an archive to browse            */
+#define IDM_EXIT            2002
+#define IDM_REGISTER        2003
+#define IDM_UNREGISTER      2004
+#define IDM_ABOUT           2005
+#define IDM_COMPRESS        2006   /* toolbar dropdown anchor              */
+#define IDM_COMPRESS_FILE   2007
+#define IDM_COMPRESS_FOLDER 2008
+#define IDM_EXTRACT         2009   /* extract selection from open archive  */
+#define IDM_EXTRACT_ALL     2010
+#define IDM_UP              2011   /* go up one folder within the archive  */
+#define IDM_CLOSE_ARCHIVE   2012
 
 /* --- globals ---------------------------------------------------------------*/
-static HWND      g_hwnd;
+static HWND      g_hwnd;                 /* the single top-level browser window */
+static HWND      g_toolbar = nullptr;
+static HWND      g_status  = nullptr;    /* status bar at the bottom            */
+static HWND      g_list    = nullptr;    /* the central file ListView           */
+static HWND      g_hint    = nullptr;    /* empty-state hint shown when idle     */
+static HWND      g_progress = nullptr;   /* progress bar, embedded in the status bar */
+static HIMAGELIST g_tbImages = nullptr;  /* custom toolbar glyphs (owned by us)  */
+static ULONG_PTR g_gdipToken = 0;        /* GDI+ lifetime token                  */
 static HFONT     g_font;
 static bool      g_busy = false;
 static ULONGLONG g_t0;
+
+struct Browser;                          /* the archive currently on screen      */
+static Browser     *g_browser = nullptr; /* null when no archive is open         */
+static std::wstring g_source;            /* file/folder queued for compression   */
 
 struct Job {
     HWND         hwnd;
@@ -174,19 +192,6 @@ static std::wstring PrettySize(long long n) {
                                   swprintf(buf, 64, L"%.1f MB", n / 1048576.0);
     else                          swprintf(buf, 64, L"%.2f GB", n / 1073741824.0);
     return buf;
-}
-
-/* Read the stream header of a .sq file to learn the original size.
- * Returns true (and sets *origSize) only for a valid SQUISH header. */
-static bool ReadSqHeader(const std::wstring &path, uint64_t *origSize) {
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                           nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    unsigned char hdr[16];
-    DWORD got = 0;
-    BOOL ok = ReadFile(h, hdr, sizeof hdr, &got, nullptr);
-    CloseHandle(h);
-    return ok && squish_decompressed_size(hdr, got, origSize) == SQUISH_OK;
 }
 
 /* --- self-extracting archive (SFX) container -------------------------------
@@ -891,92 +896,35 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
 }
 
 /* --- UI --------------------------------------------------------------------*/
+/* The status bar carries three parts: [ status text | progress | counts ]. */
 static void SetStatus(const std::wstring &s) {
-    SetDlgItemTextW(g_hwnd, IDC_STATUS, s.c_str());
+    if (g_status) SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)s.c_str());
+}
+static void SetCounts(const std::wstring &s) {
+    if (g_status) SendMessageW(g_status, SB_SETTEXTW, 2, (LPARAM)s.c_str());
 }
 
-/* Make Extract (true) or Compress (false) the default (Enter) button. */
-static void SetDefaultButton(bool extractDefault) {
-    SendDlgItemMessageW(g_hwnd, IDC_EXTRACT_BTN, BM_SETSTYLE,
-                        extractDefault ? BS_DEFPUSHBUTTON : BS_PUSHBUTTON, TRUE);
-    SendDlgItemMessageW(g_hwnd, IDC_COMPRESS_BTN, BM_SETSTYLE,
-                        extractDefault ? BS_PUSHBUTTON : BS_DEFPUSHBUTTON, TRUE);
-}
-
-static void UpdateFileInfo(void) {
-    wchar_t path[MAX_PATH];
-    GetDlgItemTextW(g_hwnd, IDC_FILE_EDIT, path, MAX_PATH);
-    if (!path[0]) { SetDlgItemTextW(g_hwnd, IDC_INFO_STATIC, L""); return; }
-
-    /* A folder is packed into a single SQAR archive stream before compression. */
-    if (IsDirectory(path)) {
-        bool sfxMode = IsDlgButtonChecked(g_hwnd, IDC_SFX_CHECK) == BST_CHECKED;
-        std::wstring out = sfxMode ? SfxOutputPath(path)
-                                   : std::wstring(path) + SQ_EXT;
-        std::wstring info = L"folder  —  will pack + " +
-                std::wstring(sfxMode ? L"build" : L"compress to") +
-                L" \"" + Basename(out) + L"\"";
-        SetDefaultButton(false);
-        SetDlgItemTextW(g_hwnd, IDC_INFO_STATIC, info.c_str());
-        return;
-    }
-
-    long long n = FileSize(path);
-    if (n < 0) {
-        SetDlgItemTextW(g_hwnd, IDC_INFO_STATIC, L"File or folder not found.");
-        return;
-    }
-    std::wstring info = PrettySize(n);
-    SfxInfo sfx;
-    uint64_t orig;
-    if (ProbeSfx(path, &sfx)) {
-        std::wstring stored;
-        ReadSfxName(path, sfx, &stored);
-        bool arc = ProbePayloadKind(path, sfx.payloadOff) == 'a';
-        info += arc ? L"  —  self-extracting SQUISH archive (folder)"
-                    : L"  —  self-extracting SQUISH archive";
-        if (!stored.empty())
-            info += L", extracts to \"" + SafeStoredName(stored) + L"\"";
-        SetDefaultButton(true);
-    } else if (ProbePayloadKind(path, 0) == 'a') {
-        std::string u8 = ToUtf8(path);
-        squish_archive *a = nullptr;
-        squish_archive_info ai;
-        if (squish_archive_open(u8.c_str(), &a) == SQUISH_OK &&
-            squish_archive_info_get(a, &ai) == SQUISH_OK) {
-            wchar_t t[96];
-            swprintf(t, 96, L"  —  SQUISH archive, %llu items, %s uncompressed",
-                     (unsigned long long)ai.entry_count,
-                     PrettySize((long long)ai.total_size).c_str());
-            info += t;
-        } else {
-            info += L"  —  SQUISH directory archive";
-        }
-        if (a) squish_archive_close(a);
-        SetDefaultButton(true);
-    } else if (ReadSqHeader(path, &orig)) {
-        info += L"  —  SQUISH stream, original size " +
-                PrettySize((long long)orig);
-        SetDefaultButton(true);
-    } else {
-        bool sfxMode = IsDlgButtonChecked(g_hwnd, IDC_SFX_CHECK) == BST_CHECKED;
-        std::wstring out = sfxMode ? SfxOutputPath(path)
-                                   : std::wstring(path) + SQ_EXT;
-        info += L"  —  will " +
-                std::wstring(sfxMode ? L"build" : L"compress to") +
-                L" \"" + Basename(out) + L"\"";
-        SetDefaultButton(false);
-    }
-    SetDlgItemTextW(g_hwnd, IDC_INFO_STATIC, info.c_str());
-}
-
+/* Enable/disable the input chrome while a background job runs. */
 static void SetBusy(bool busy) {
     g_busy = busy;
-    for (int id : { IDC_FILE_EDIT, IDC_BROWSE_BTN, IDC_CPU_COMBO, IDC_SFX_CHECK,
-                    IDC_COMPRESS_BTN, IDC_EXTRACT_BTN, IDC_VIEW_BTN })
-        EnableWindow(GetDlgItem(g_hwnd, id), !busy);
+    EnableWindow(g_toolbar, !busy);
+    EnableWindow(GetDlgItem(g_hwnd, IDC_CPU_COMBO), !busy);
+    EnableWindow(GetDlgItem(g_hwnd, IDC_SFX_CHECK), !busy);
+    ShowWindow(g_progress, busy ? SW_SHOW : SW_HIDE);
     if (!busy)
-        SendDlgItemMessageW(g_hwnd, IDC_PROGRESS, PBM_SETPOS, 0, 0);
+        SendMessageW(g_progress, PBM_SETPOS, 0, 0);
+}
+
+/* Show, in the status bar, what the queued compression source is. */
+static void RefreshSourceStatus(void) {
+    if (g_source.empty()) return;
+    bool isDir = IsDirectory(g_source);
+    bool sfxMode = IsDlgButtonChecked(g_hwnd, IDC_SFX_CHECK) == BST_CHECKED;
+    std::wstring out = sfxMode ? SfxOutputPath(g_source) : g_source + SQ_EXT;
+    std::wstring info = (isDir ? L"Folder \"" : L"File \"") +
+            Basename(g_source) + L"\" ready — Compress writes \"" +
+            Basename(out) + L"\"";
+    SetStatus(info);
 }
 
 /* Worker count chosen in the CPU-cores combo (items are "1".."ncpu", so the
@@ -998,11 +946,8 @@ static std::wstring OutputPath(const std::wstring &src, bool compress) {
     return src + L".out";
 }
 
-static void StartJob(bool compress) {
+static void StartJob(bool compress, const std::wstring &src) {
     if (g_busy) return;
-    wchar_t buf[MAX_PATH];
-    GetDlgItemTextW(g_hwnd, IDC_FILE_EDIT, buf, MAX_PATH);
-    std::wstring src = buf;
     if (src.empty()) {
         MessageBoxW(g_hwnd, L"Choose a file or folder first.", APP_NAME,
                     MB_ICONINFORMATION);
@@ -1082,18 +1027,15 @@ static void StartJob(bool compress) {
     CloseHandle(th);
 }
 
-/* "View Files": open the selected archive in the browser window.
+/* Open an archive in the browser pane of the main window.
  *
  * A seekable SQAR02 archive opens instantly (only its header + index are read),
  * straight on the UI thread. A plain §1 stream — a single file, or an archive
  * from an older winsquish (a solid SQAR01 tree) — has no random access, so it
  * must be decompressed whole first: that runs on the worker thread with a
  * progress bar, and OnJobDone opens the browser from the resulting blob. */
-static void StartView(void) {
+static void BrowsePath(const std::wstring &src) {
     if (g_busy) return;
-    wchar_t buf[MAX_PATH];
-    GetDlgItemTextW(g_hwnd, IDC_FILE_EDIT, buf, MAX_PATH);
-    std::wstring src = buf;
     if (src.empty()) {
         MessageBoxW(g_hwnd, L"Choose a .sq or self-extracting archive first.",
                     APP_NAME, MB_ICONINFORMATION);
@@ -1139,6 +1081,7 @@ static void StartView(void) {
 static void OnJobDone(int rc) {
     Job *job = g_job; g_job = nullptr;
     double secs = (GetTickCount64() - g_t0) / 1000.0;
+    std::wstring browseNext;   /* archive to open in the browser once done */
     SetBusy(false);
     if (!job) return;
 
@@ -1146,7 +1089,7 @@ static void OnJobDone(int rc) {
      * tree or single file — OpenBlobBrowser decides). */
     if (job->listing) {
         if (rc == SQUISH_OK) {
-            SendDlgItemMessageW(g_hwnd, IDC_PROGRESS, PBM_SETPOS, 100, 0);
+            SendMessageW(g_progress, PBM_SETPOS, 100, 0);
             SetStatus(L"Archive opened for browsing.");
             OpenBlobBrowser(job->src, std::move(job->blob), job->threads);
         } else {
@@ -1202,30 +1145,51 @@ static void OnJobDone(int rc) {
                      secs, PrettySize(out).c_str());
         }
         SetStatus(msg);
-        SendDlgItemMessageW(g_hwnd, IDC_PROGRESS, PBM_SETPOS, 100, 0);
-        /* reveal the result in Explorer-friendly fashion: select the file box */
-        SetDlgItemTextW(g_hwnd, IDC_FILE_EDIT, job->dst.c_str());
-        UpdateFileInfo();
+        /* If we just packed a folder into a browsable archive, open it so the
+         * user lands inside the new archive's contents (WinZip-style). */
+        if (job->compress && !job->sfx &&
+            ProbePayloadKind(job->dst, 0) == 'a')
+            browseNext = job->dst;
     }
     delete job;
+    if (!browseNext.empty()) BrowsePath(browseNext);
 }
 
-static void BrowseFile(void) {
+/* "Open": pick an existing .sq / self-extracting archive and browse it. */
+static void OpenArchiveDialog(void) {
+    if (g_busy) return;
     wchar_t buf[MAX_PATH] = L"";
     OPENFILENAMEW ofn = { sizeof ofn };
     ofn.hwndOwner   = g_hwnd;
     ofn.lpstrFile   = buf;
     ofn.nMaxFile    = MAX_PATH;
-    ofn.lpstrFilter = L"All files\0*.*\0SQUISH files (*.sq)\0*.sq\0";
+    ofn.lpstrFilter = L"SQUISH archives (*.sq;*.exe)\0*.sq;*.exe\0"
+                      L"All files\0*.*\0";
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (GetOpenFileNameW(&ofn))
+        BrowsePath(buf);
+}
+
+/* "Compress ▸ File…": pick a file and compress it straight away. */
+static void CompressFileDialog(void) {
+    if (g_busy) return;
+    wchar_t buf[MAX_PATH] = L"";
+    OPENFILENAMEW ofn = { sizeof ofn };
+    ofn.hwndOwner   = g_hwnd;
+    ofn.lpstrFile   = buf;
+    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrFilter = L"All files\0*.*\0";
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     if (GetOpenFileNameW(&ofn)) {
-        SetDlgItemTextW(g_hwnd, IDC_FILE_EDIT, buf);
-        UpdateFileInfo();
+        g_source = buf;
+        StartJob(true, g_source);
     }
 }
 
-/* Pick a folder to compress (IFileOpenDialog in pick-folders mode). */
-static void BrowseFolder(void) {
+/* "Compress ▸ Folder…": pick a folder (IFileOpenDialog, pick-folders) and pack
+ * it into a single SQAR archive. */
+static void CompressFolderDialog(void) {
+    if (g_busy) return;
     IFileOpenDialog *dlg = nullptr;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr,
                                 CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))))
@@ -1238,9 +1202,9 @@ static void BrowseFolder(void) {
         if (SUCCEEDED(dlg->GetResult(&item))) {
             PWSTR path = nullptr;
             if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
-                SetDlgItemTextW(g_hwnd, IDC_FILE_EDIT, path);
-                UpdateFileInfo();
+                g_source = path;
                 CoTaskMemFree(path);
+                StartJob(true, g_source);
             }
             item->Release();
         }
@@ -1289,16 +1253,17 @@ static int g_dpi = 96;
 static int S(int v) { return MulDiv(v, g_dpi, 96); }
 
 /* ============================================================================
- * Archive browser — a WinRAR-style window listing the contents of an archive
+ * Archive browser — the central file list of the main window
  *
- * A seekable SQAR archive opens instantly — only its header and index are read
- * — and each file is inflated on demand, by seeking straight to its own stream,
- * when the user extracts it (libsquish's squish_archive_* API). A plain
- * single-file .sq (or SFX payload) shows as one member and is decompressed
- * whole on extraction. Navigate folders by double-clicking (Up / Backspace to
- * ascend), sort by column, and extract the current selection or everything.
+ * The main window doubles as a WinZip/PeaZip-style archive browser: its central
+ * ListView shows the contents of whatever archive is open. A seekable SQAR
+ * archive opens instantly — only its header and index are read — and each file
+ * is inflated on demand, by seeking straight to its own stream, when the user
+ * extracts it (libsquish's squish_archive_* API). A plain single-file .sq (or
+ * SFX payload) shows as one member and is decompressed whole on extraction.
+ * Navigate folders by double-clicking (Up / Backspace to ascend), sort by
+ * column, and extract the current selection or everything.
  * ==========================================================================*/
-static const wchar_t *BROWSER_CLASS = L"WinSquishBrowserWindow";
 
 /* One row of the current folder view (a child of the browser's cwd). */
 struct ViewRow {
@@ -1443,18 +1408,42 @@ static std::wstring ParentCwd(const std::wstring &cwd) {
     return s == std::wstring::npos ? std::wstring() : t.substr(0, s + 1);
 }
 
-/* Move to a folder and refresh the list, path bar and Up button. */
+static void ExtractSelection(Browser *b, bool all);   /* fwd */
+
+/* Sync the toolbar button states and the status-bar item counts to the archive
+ * that is currently open (g_browser), or to the empty state when none is. */
+static void UpdateChrome(void) {
+    bool open = g_browser != nullptr;
+    SendMessageW(g_toolbar, TB_ENABLEBUTTON, IDM_EXTRACT,     MAKELONG(open, 0));
+    SendMessageW(g_toolbar, TB_ENABLEBUTTON, IDM_EXTRACT_ALL, MAKELONG(open, 0));
+    bool canUp = open && !g_browser->cwd.empty();
+    SendMessageW(g_toolbar, TB_ENABLEBUTTON, IDM_UP, MAKELONG(canUp, 0));
+    ShowWindow(g_hint, open ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_list, open ? SW_SHOW : SW_HIDE);
+    if (!open) { SetCounts(L""); return; }
+    int total = ListView_GetItemCount(g_list);
+    if (!g_browser->cwd.empty() && total > 0) total--;   /* discount ".." row */
+    int sel = ListView_GetSelectedCount(g_list);
+    wchar_t s[64];
+    if (sel > 0) swprintf(s, 64, L"%d of %d selected", sel, total);
+    else         swprintf(s, 64, L"%d item%s", total, total == 1 ? L"" : L"s");
+    SetCounts(s);
+}
+
+/* Move to a folder and refresh the list, address bar and toolbar. */
 static void NavigateTo(Browser *b, const std::wstring &cwd) {
     b->cwd = cwd;
     BuildView(b);
     FillList(b);
-    std::wstring disp = L"\\" + b->cwd;
+    std::wstring disp = Basename(b->archivePath) + L"\\" + b->cwd;
     for (wchar_t &c : disp) if (c == L'/') c = L'\\';
+    if (disp.size() > 1 && disp.back() == L'\\') disp.pop_back();
     SetWindowTextW(GetDlgItem(b->hwnd, IDC_PATH_STATIC), disp.c_str());
-    EnableWindow(GetDlgItem(b->hwnd, IDC_UP_BTN), !b->cwd.empty());
+    UpdateChrome();
 }
 
-/* Double-click / Enter on a row: descend into folders, ascend on "..". */
+/* Double-click / Enter on a row: descend into folders, ascend on "..", and for
+ * a file, offer to extract it (Save As). */
 static void ActivateRow(Browser *b, int item) {
     LVITEMW it = { 0 };
     it.mask = LVIF_PARAM; it.iItem = item;
@@ -1464,6 +1453,7 @@ static void ActivateRow(Browser *b, int item) {
     const ViewRow &r = b->view[vi];
     if (r.isUp)       NavigateTo(b, ParentCwd(b->cwd));
     else if (r.isDir) NavigateTo(b, r.fullPath + L"/");
+    else              ExtractSelection(b, false);
 }
 
 /* Pick a destination folder (IFileOpenDialog, pick-folders mode). */
@@ -1734,103 +1724,6 @@ static void ExtractSelection(Browser *b, bool all) {
                 (okAll && !cancelled) ? MB_ICONINFORMATION : MB_ICONWARNING);
 }
 
-static LRESULT CALLBACK BrowserProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    Browser *b = (Browser *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-    switch (msg) {
-    case WM_CREATE: {
-        CREATESTRUCTW *cs = (CREATESTRUCTW *)lp;
-        b = (Browser *)cs->lpCreateParams;
-        b->hwnd = hwnd;
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)b);
-        HINSTANCE hi = GetModuleHandleW(nullptr);
-        DWORD bs = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
-        HWND up  = CreateWindowExW(0, L"BUTTON", L"Up", bs,
-                                   0, 0, 0, 0, hwnd, (HMENU)IDC_UP_BTN, hi, nullptr);
-        HWND es  = CreateWindowExW(0, L"BUTTON", L"Extract Selected…", bs,
-                                   0, 0, 0, 0, hwnd, (HMENU)IDC_EXTRACT_SEL, hi, nullptr);
-        HWND ea  = CreateWindowExW(0, L"BUTTON", L"Extract All…", bs,
-                                   0, 0, 0, 0, hwnd, (HMENU)IDC_EXTRACT_ALL, hi, nullptr);
-        HWND pth = CreateWindowExW(0, L"STATIC", L"\\",
-                                   WS_CHILD | WS_VISIBLE | SS_PATHELLIPSIS | SS_CENTERIMAGE,
-                                   0, 0, 0, 0, hwnd, (HMENU)IDC_PATH_STATIC, hi, nullptr);
-        HWND lv  = CreateWindowExW(0, WC_LISTVIEWW, L"",
-                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP |
-                                   LVS_REPORT | LVS_SHOWSELALWAYS,
-                                   0, 0, 0, 0, hwnd, (HMENU)IDC_LV, hi, nullptr);
-        b->hlist = lv;
-        for (HWND h : { up, es, ea, pth, lv })
-            SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
-        ListView_SetExtendedListViewStyle(lv,
-            LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP);
-        HIMAGELIST il = SysImageListSmall();
-        if (il) ListView_SetImageList(lv, il, LVSIL_SMALL);
-        LVCOLUMNW c = { 0 };
-        c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
-        c.pszText = (LPWSTR)L"Name"; c.cx = S(260); c.iSubItem = 0; ListView_InsertColumn(lv, 0, &c);
-        c.pszText = (LPWSTR)L"Size"; c.cx = S(90);  c.iSubItem = 1; ListView_InsertColumn(lv, 1, &c);
-        c.pszText = (LPWSTR)L"Type"; c.cx = S(120); c.iSubItem = 2; ListView_InsertColumn(lv, 2, &c);
-        NavigateTo(b, L"");
-        return 0;
-    }
-
-    case WM_SIZE: {
-        if (!b || !b->hlist) return 0;
-        RECT rc; GetClientRect(hwnd, &rc);
-        int pad = S(8), bh = S(26), by = pad, bx = pad;
-        MoveWindow(GetDlgItem(hwnd, IDC_UP_BTN),       bx, by, S(48),  bh, TRUE); bx += S(48)  + pad;
-        MoveWindow(GetDlgItem(hwnd, IDC_EXTRACT_SEL),  bx, by, S(140), bh, TRUE); bx += S(140) + pad;
-        MoveWindow(GetDlgItem(hwnd, IDC_EXTRACT_ALL),  bx, by, S(100), bh, TRUE); bx += S(100) + pad;
-        int pathW = rc.right - bx - pad; if (pathW < S(40)) pathW = S(40);
-        MoveWindow(GetDlgItem(hwnd, IDC_PATH_STATIC),  bx, by + S(4), pathW, S(18), TRUE);
-        int lvY = by + bh + pad;
-        MoveWindow(b->hlist, pad, lvY, rc.right - 2 * pad, rc.bottom - lvY - pad, TRUE);
-        return 0;
-    }
-
-    case WM_COMMAND:
-        if (!b) break;
-        switch (LOWORD(wp)) {
-        case IDC_UP_BTN:      NavigateTo(b, ParentCwd(b->cwd)); return 0;
-        case IDC_EXTRACT_SEL: ExtractSelection(b, false);       return 0;
-        case IDC_EXTRACT_ALL: ExtractSelection(b, true);        return 0;
-        }
-        break;
-
-    case WM_NOTIFY: {
-        NMHDR *nh = (NMHDR *)lp;
-        if (!b || nh->idFrom != IDC_LV) break;
-        if (nh->code == LVN_ITEMACTIVATE) {
-            /* Fires on the user's "open" gesture — double- OR single-click per
-             * their Windows setting, and Enter — so folders open either way. */
-            NMITEMACTIVATE *ia = (NMITEMACTIVATE *)lp;
-            if (ia->iItem >= 0) ActivateRow(b, ia->iItem);
-            return 0;
-        }
-        if (nh->code == LVN_KEYDOWN) {
-            NMLVKEYDOWN *kd = (NMLVKEYDOWN *)lp;
-            if (kd->wVKey == VK_BACK) { NavigateTo(b, ParentCwd(b->cwd)); return 0; }
-        }
-        if (nh->code == LVN_COLUMNCLICK) {
-            NMLISTVIEW *nl = (NMLISTVIEW *)lp;
-            if (nl->iSubItem == b->sortCol) b->sortAsc = !b->sortAsc;
-            else { b->sortCol = nl->iSubItem; b->sortAsc = true; }
-            BuildView(b); FillList(b);
-            return 0;
-        }
-        break;
-    }
-
-    case WM_DESTROY:
-        if (b) {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            if (b->arc) squish_archive_close(b->arc);
-            delete b;
-        }
-        return 0;
-    }
-    return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
 /* Fill b->entries from an open seekable archive handle. */
 static int LoadArchiveEntries(Browser *b) {
     uint64_t n = squish_archive_count(b->arc);
@@ -1863,36 +1756,37 @@ static Browser *NewBrowser(const std::wstring &archivePath, int threads) {
     return b;
 }
 
-/* Create and show the browser window for a fully populated Browser. On failure
- * the Browser (and any archive handle) is freed. */
-static void ShowBrowserWindow(Browser *b) {
-    static bool registered = false;
-    if (!registered) {
-        WNDCLASSEXW wc = { sizeof wc };
-        wc.lpfnWndProc   = BrowserProc;
-        wc.hInstance     = GetModuleHandleW(nullptr);
-        wc.hIcon         = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(IDI_APP));
-        wc.hIconSm       = wc.hIcon;
-        wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        wc.lpszClassName = BROWSER_CLASS;
-        RegisterClassExW(&wc);
-        registered = true;
+/* Adopt a fully populated Browser as the archive shown in the main window,
+ * replacing (and freeing) any archive that was open before. The main window's
+ * ListView becomes this archive's view. */
+static void LoadBrowserIntoMain(Browser *b) {
+    if (g_browser) {
+        if (g_browser->arc) squish_archive_close(g_browser->arc);
+        delete g_browser;
+        g_browser = nullptr;
     }
-    std::wstring title = Basename(b->archivePath) + L" — WinSquish";
-    RECT r = { 0, 0, S(560), S(420) };
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    HWND hwnd = CreateWindowExW(0, BROWSER_CLASS, title.c_str(),
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-        r.right - r.left, r.bottom - r.top,
-        nullptr, nullptr, GetModuleHandleW(nullptr), b);
-    if (!hwnd) {                       /* WM_CREATE never ran => b not adopted */
-        if (b->arc) squish_archive_close(b->arc);
-        delete b;
-        return;
-    }
-    ShowWindow(hwnd, SW_SHOW);
-    UpdateWindow(hwnd);
+    b->hwnd  = g_hwnd;
+    b->hlist = g_list;
+    g_browser = b;
+    ListView_DeleteAllItems(g_list);
+    NavigateTo(b, L"");
+    std::wstring title = Basename(b->archivePath) + L" — " + APP_NAME;
+    SetWindowTextW(g_hwnd, title.c_str());
+    SetStatus(L"Archive opened.");
+    SetFocus(g_list);
+}
+
+/* Close the open archive and return the main window to its empty state. */
+static void CloseArchive(void) {
+    if (!g_browser) return;
+    if (g_browser->arc) squish_archive_close(g_browser->arc);
+    delete g_browser;
+    g_browser = nullptr;
+    ListView_DeleteAllItems(g_list);
+    SetWindowTextW(GetDlgItem(g_hwnd, IDC_PATH_STATIC), L"");
+    SetWindowTextW(g_hwnd, APP_NAME);
+    SetStatus(L"Ready.");
+    UpdateChrome();
 }
 
 /* Open a seekable SQAR02 archive (plain .sq or an SFX payload) in the browser,
@@ -1921,7 +1815,7 @@ static void OpenArchiveBrowser(const std::wstring &archivePath, int threads) {
                     APP_NAME, MB_ICONERROR);
         delete b; return;
     }
-    ShowBrowserWindow(b);
+    LoadBrowserIntoMain(b);
 }
 
 /* Open the browser from an already-decompressed blob: a legacy SQAR01 tree
@@ -1956,53 +1850,227 @@ static void OpenBlobBrowser(const std::wstring &archivePath, std::string blob,
         ArcEntry e = { nm, false, (uint64_t)n, 0, 0 };
         b->entries.push_back(std::move(e));
     }
-    ShowBrowserWindow(b);
+    LoadBrowserIntoMain(b);
+}
+
+/* --- custom toolbar glyphs (drawn with GDI+ so they scale with DPI) ---------
+ * Four flat, colourful icons rendered on a 16x16 design grid scaled to `px`:
+ * an amber open folder (Open), a purple box squeezed by arrows (Compress), a
+ * green arrow lifting out of a tray (Extract), and a blue up-arrow (Up). Each
+ * is rasterised to a premultiplied 32-bpp bitmap and added to an image list. */
+static void RoundRectPath(Gdiplus::GraphicsPath &p, Gdiplus::REAL x,
+                          Gdiplus::REAL y, Gdiplus::REAL w, Gdiplus::REAL h,
+                          Gdiplus::REAL r) {
+    p.AddArc(x, y, 2 * r, 2 * r, 180, 90);
+    p.AddArc(x + w - 2 * r, y, 2 * r, 2 * r, 270, 90);
+    p.AddArc(x + w - 2 * r, y + h - 2 * r, 2 * r, 2 * r, 0, 90);
+    p.AddArc(x, y + h - 2 * r, 2 * r, 2 * r, 90, 90);
+    p.CloseFigure();
+}
+
+static void GlyphOpen(Gdiplus::Graphics &g, Gdiplus::REAL u) {
+    using namespace Gdiplus;
+    SolidBrush dark(Color(255, 0xD8, 0x8C, 0x14));
+    SolidBrush lite(Color(255, 0xFF, 0xC9, 0x4D));
+    g.FillRectangle(&dark, 1.5f * u, 2.6f * u, 6.0f * u, 2.4f * u);   /* tab   */
+    GraphicsPath body; RoundRectPath(body, 1.5f * u, 3.8f * u,
+                                     13.0f * u, 9.7f * u, 1.1f * u);
+    g.FillPath(&dark, &body);                                        /* back  */
+    PointF front[4] = { PointF(1.6f * u, 13.5f * u), PointF(4.3f * u, 6.9f * u),
+                        PointF(15.5f * u, 6.9f * u), PointF(12.8f * u, 13.5f * u) };
+    g.FillPolygon(&lite, front, 4);                                  /* open lid */
+}
+
+static void GlyphCompress(Gdiplus::Graphics &g, Gdiplus::REAL u) {
+    using namespace Gdiplus;
+    SolidBrush box(Color(255, 0x6E, 0x3A, 0xA6));
+    SolidBrush white(Color(255, 0xFF, 0xFF, 0xFF));
+    GraphicsPath p; RoundRectPath(p, 2.0f * u, 2.0f * u,
+                                  12.0f * u, 12.0f * u, 2.0f * u);
+    g.FillPath(&box, &p);
+    PointF top[3] = { PointF(5.6f * u, 4.2f * u), PointF(10.4f * u, 4.2f * u),
+                      PointF(8.0f * u, 7.0f * u) };                  /* ▼ */
+    PointF bot[3] = { PointF(5.6f * u, 11.8f * u), PointF(10.4f * u, 11.8f * u),
+                      PointF(8.0f * u, 9.0f * u) };                  /* ▲ */
+    g.FillPolygon(&white, top, 3);
+    g.FillPolygon(&white, bot, 3);
+    g.FillRectangle(&white, 5.0f * u, 7.55f * u, 6.0f * u, 0.9f * u);/* seam */
+}
+
+static void GlyphExtract(Gdiplus::Graphics &g, Gdiplus::REAL u) {
+    using namespace Gdiplus;
+    SolidBrush tray(Color(255, 0x54, 0x64, 0x74));
+    g.FillRectangle(&tray, 2.5f * u,  9.0f * u,  2.0f * u, 5.0f * u);/* left  */
+    g.FillRectangle(&tray, 11.5f * u, 9.0f * u,  2.0f * u, 5.0f * u);/* right */
+    g.FillRectangle(&tray, 2.5f * u,  12.4f * u, 11.0f * u, 1.6f * u);/* base */
+    SolidBrush green(Color(255, 0x33, 0xA8, 0x4A));
+    g.FillRectangle(&green, 6.9f * u, 5.2f * u, 2.2f * u, 5.8f * u);  /* shaft */
+    PointF head[3] = { PointF(5.0f * u, 5.6f * u), PointF(11.0f * u, 5.6f * u),
+                       PointF(8.0f * u, 1.8f * u) };                 /* ▲ out */
+    g.FillPolygon(&green, head, 3);
+}
+
+static void GlyphUp(Gdiplus::Graphics &g, Gdiplus::REAL u) {
+    using namespace Gdiplus;
+    SolidBrush blue(Color(255, 0x2E, 0x77, 0xC9));
+    g.FillRectangle(&blue, 6.8f * u, 6.8f * u, 2.4f * u, 6.7f * u);  /* shaft */
+    PointF head[3] = { PointF(3.8f * u, 7.4f * u), PointF(12.2f * u, 7.4f * u),
+                       PointF(8.0f * u, 2.5f * u) };                 /* ▲ */
+    g.FillPolygon(&blue, head, 3);
+}
+
+/* Rasterise `bmp` (straight ARGB) into a premultiplied top-down 32-bpp DIB so
+ * comctl32 alpha-blends the icon cleanly over the toolbar. */
+static HBITMAP PremultipliedDib(Gdiplus::Bitmap &bmp, int px) {
+    using namespace Gdiplus;
+    Rect rc(0, 0, px, px);
+    BitmapData bd;
+    if (bmp.LockBits(&rc, ImageLockModeRead, PixelFormat32bppARGB, &bd) != Ok)
+        return nullptr;
+    BITMAPINFO bi = { 0 };
+    bi.bmiHeader.biSize     = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth    = px;
+    bi.bmiHeader.biHeight   = -px;          /* top-down */
+    bi.bmiHeader.biPlanes   = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void *bits = nullptr;
+    HDC dc = GetDC(nullptr);
+    HBITMAP dib = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, dc);
+    if (dib && bits) {
+        for (int y = 0; y < px; y++) {
+            const BYTE *s = (const BYTE *)bd.Scan0 + (size_t)y * bd.Stride;
+            BYTE *d = (BYTE *)bits + (size_t)y * px * 4;
+            for (int x = 0; x < px; x++, s += 4, d += 4) {
+                unsigned a = s[3];
+                d[0] = (BYTE)(s[0] * a / 255);   /* B */
+                d[1] = (BYTE)(s[1] * a / 255);   /* G */
+                d[2] = (BYTE)(s[2] * a / 255);   /* R */
+                d[3] = (BYTE)a;
+            }
+        }
+    }
+    bmp.UnlockBits(&bd);
+    return dib;
+}
+
+/* Build the toolbar's 4-glyph image list at the given icon size. */
+static HIMAGELIST BuildToolbarImageList(int px) {
+    HIMAGELIST il = ImageList_Create(px, px, ILC_COLOR32, 4, 0);
+    if (!il) return nullptr;
+    void (*draws[4])(Gdiplus::Graphics &, Gdiplus::REAL) =
+        { GlyphOpen, GlyphCompress, GlyphExtract, GlyphUp };
+    for (int i = 0; i < 4; i++) {
+        Gdiplus::Bitmap bmp(px, px, PixelFormat32bppARGB);
+        Gdiplus::Graphics g(&bmp);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.Clear(Gdiplus::Color(0, 0, 0, 0));
+        draws[i](g, (Gdiplus::REAL)px / 16.0f);
+        g.Flush(Gdiplus::FlushIntentionSync);
+        HBITMAP hb = PremultipliedDib(bmp, px);
+        if (hb) { ImageList_Add(il, hb, nullptr); DeleteObject(hb); }
+    }
+    return il;
+}
+
+/* Build the top toolbar (WinZip/PeaZip-style icon+text buttons) with the custom
+ * glyphs above. */
+static void CreateToolbar(HWND hwnd) {
+    HINSTANCE hi = GetModuleHandleW(nullptr);
+    g_toolbar = CreateWindowExW(0, TOOLBARCLASSNAMEW, nullptr,
+        WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_LIST |
+        TBSTYLE_TOOLTIPS | CCS_NODIVIDER | CCS_NORESIZE,
+        0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_TOOLBAR, hi, nullptr);
+    SendMessageW(g_toolbar, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
+    SendMessageW(g_toolbar, TB_SETEXTENDEDSTYLE, 0,
+                 TBSTYLE_EX_DRAWDDARROWS | TBSTYLE_EX_MIXEDBUTTONS);
+
+    g_tbImages = BuildToolbarImageList(S(20));
+    SendMessageW(g_toolbar, TB_SETIMAGELIST, 0, (LPARAM)g_tbImages);
+
+    INT_PTR sOpen = SendMessageW(g_toolbar, TB_ADDSTRINGW, 0, (LPARAM)L"Open\0");
+    INT_PTR sComp = SendMessageW(g_toolbar, TB_ADDSTRINGW, 0, (LPARAM)L"Compress\0");
+    INT_PTR sExtr = SendMessageW(g_toolbar, TB_ADDSTRINGW, 0, (LPARAM)L"Extract\0");
+    INT_PTR sUp   = SendMessageW(g_toolbar, TB_ADDSTRINGW, 0, (LPARAM)L"Up\0");
+
+    TBBUTTON tb[5] = { 0 };
+    tb[0].iBitmap = 0;  tb[0].idCommand = IDM_OPEN;
+    tb[0].fsState = TBSTATE_ENABLED; tb[0].fsStyle = BTNS_AUTOSIZE | BTNS_SHOWTEXT;
+    tb[0].iString = sOpen;
+    tb[1].iBitmap = 1;  tb[1].idCommand = IDM_COMPRESS;
+    tb[1].fsState = TBSTATE_ENABLED;
+    tb[1].fsStyle = BTNS_AUTOSIZE | BTNS_SHOWTEXT | BTNS_WHOLEDROPDOWN;
+    tb[1].iString = sComp;
+    tb[2].iBitmap = 2;  tb[2].idCommand = IDM_EXTRACT;
+    tb[2].fsState = 0;  tb[2].fsStyle = BTNS_AUTOSIZE | BTNS_SHOWTEXT;
+    tb[2].iString = sExtr;
+    tb[3].fsStyle = BTNS_SEP;
+    tb[4].iBitmap = 3;  tb[4].idCommand = IDM_UP;
+    tb[4].fsState = 0;  tb[4].fsStyle = BTNS_AUTOSIZE | BTNS_SHOWTEXT;
+    tb[4].iString = sUp;
+    SendMessageW(g_toolbar, TB_ADDBUTTONS, 5, (LPARAM)tb);
+    SendMessageW(g_toolbar, TB_AUTOSIZE, 0, 0);
 }
 
 static void CreateControls(HWND hwnd) {
-    struct Ctl {
-        const wchar_t *cls, *text; DWORD style; int x, y, w, h, id;
-    };
+    HINSTANCE hi = GetModuleHandleW(nullptr);
     const DWORD ES = WS_CHILD | WS_VISIBLE;
-    const Ctl ctls[] = {
-        { L"STATIC",   L"File:", ES, 12, 15, 30, 20, 0 },
-        { L"EDIT",     L"", ES | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-                                  48, 12, 340, 24, IDC_FILE_EDIT },
-        { L"BUTTON",   L"Browse…", ES | WS_TABSTOP,
-                                  396, 11, 80, 26, IDC_BROWSE_BTN },
-        { L"STATIC",   L"Drop a file or folder here, or use File ▸ Open.", ES,
-                                  12, 44, 464, 20, IDC_INFO_STATIC },
-        { L"STATIC",   L"CPU cores:", ES | SS_CENTERIMAGE,
-                                  12, 68, 66, 22, 0 },
-        { L"COMBOBOX", L"", ES | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
-                                  82, 66, 56, 200, IDC_CPU_COMBO },
-        { L"STATIC",   L"(1 = smallest file, single block; more = faster)",
-                       ES | SS_CENTERIMAGE,
-                                  146, 68, 330, 22, 0 },
-        { L"BUTTON",   L"Create self-extracting archive (.exe, runs on Windows)",
-                       ES | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                  12, 90, 464, 20, IDC_SFX_CHECK },
-        { L"BUTTON",   L"Compress", ES | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                  12, 118, 110, 30, IDC_COMPRESS_BTN },
-        { L"BUTTON",   L"Extract", ES | WS_TABSTOP,
-                                  130, 118, 110, 30, IDC_EXTRACT_BTN },
-        { L"BUTTON",   L"View Files…", ES | WS_TABSTOP,
-                                  248, 118, 110, 30, IDC_VIEW_BTN },
-        { PROGRESS_CLASSW, L"", ES, 12, 158, 464, 18, IDC_PROGRESS },
-        { L"STATIC",   L"Ready.", ES | SS_PATHELLIPSIS,
-                                  12, 182, 464, 20, IDC_STATUS },
-    };
-    for (const Ctl &c : ctls) {
-        HWND h = CreateWindowExW(0, c.cls, c.text, c.style,
-                                 S(c.x), S(c.y), S(c.w), S(c.h),
-                                 hwnd, (HMENU)(INT_PTR)c.id,
-                                 GetModuleHandleW(nullptr), nullptr);
-        SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
-    }
-    SendDlgItemMessageW(hwnd, IDC_PROGRESS, PBM_SETRANGE32, 0, 100);
 
-    /* Populate the CPU-cores combo with 1..ncpu and default to 4 (clamped to
-     * the machine). We deliberately do NOT default to "all cores". */
+    CreateToolbar(hwnd);
+
+    /* Address bar: "Location:" + the current archive/folder path. */
+    CreateWindowExW(0, L"STATIC", L"Location:", ES | SS_CENTERIMAGE,
+                    0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_LOC_LABEL, hi, nullptr);
+    CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"",
+                    ES | SS_PATHELLIPSIS | SS_CENTERIMAGE,
+                    0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_PATH_STATIC, hi, nullptr);
+    /* Compression options, right-aligned on the address row. */
+    CreateWindowExW(0, L"BUTTON", L"Self-extracting .exe",
+                    ES | WS_TABSTOP | BS_AUTOCHECKBOX,
+                    0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_SFX_CHECK, hi, nullptr);
+    CreateWindowExW(0, L"STATIC", L"CPU:", ES | SS_CENTERIMAGE,
+                    0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_CPU_LABEL, hi, nullptr);
+    CreateWindowExW(0, L"COMBOBOX", L"",
+                    ES | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
+                    0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_CPU_COMBO, hi, nullptr);
+
+    /* The central file list — the archive browser. */
+    g_list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                    ES | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS,
+                    0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_LV, hi, nullptr);
+    ListView_SetExtendedListViewStyle(g_list,
+        LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP);
+    HIMAGELIST il = SysImageListSmall();
+    if (il) ListView_SetImageList(g_list, il, LVSIL_SMALL);
+    LVCOLUMNW c = { 0 };
+    c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+    c.pszText = (LPWSTR)L"Name"; c.cx = S(340); c.iSubItem = 0; ListView_InsertColumn(g_list, 0, &c);
+    c.pszText = (LPWSTR)L"Size"; c.cx = S(110); c.iSubItem = 1; ListView_InsertColumn(g_list, 1, &c);
+    c.pszText = (LPWSTR)L"Type"; c.cx = S(150); c.iSubItem = 2; ListView_InsertColumn(g_list, 2, &c);
+
+    /* Empty-state hint, drawn over the (hidden) list when no archive is open. */
+    g_hint = CreateWindowExW(0, L"STATIC",
+        L"No archive open\r\n\r\n"
+        L"Open  —  browse an existing .sq or self-extracting archive\r\n"
+        L"Compress  —  pack a file or folder into a new .sq\r\n\r\n"
+        L"…or drag a file, folder, or archive onto this window.",
+        ES | SS_CENTER, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_HINT, hi, nullptr);
+
+    /* Status bar with an embedded progress bar over its middle part. */
+    g_status = CreateWindowExW(0, STATUSCLASSNAMEW, L"Ready.",
+        WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+        0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_STATUSBAR, hi, nullptr);
+    g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD,
+        0, 0, 0, 0, g_status, (HMENU)(INT_PTR)IDC_PROGRESS, hi, nullptr);
+    SendMessageW(g_progress, PBM_SETRANGE32, 0, 100);
+
+    for (HWND h : { GetDlgItem(hwnd, IDC_LOC_LABEL), GetDlgItem(hwnd, IDC_PATH_STATIC),
+                    GetDlgItem(hwnd, IDC_CPU_LABEL), GetDlgItem(hwnd, IDC_CPU_COMBO),
+                    GetDlgItem(hwnd, IDC_SFX_CHECK), g_list, g_hint })
+        SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
+
+    /* CPU-cores combo: 1..ncpu, default 4 clamped to the machine (never "all"). */
     int ncpu = squish_threads();
     if (ncpu < 1) ncpu = 1;
     HWND combo = GetDlgItem(hwnd, IDC_CPU_COMBO);
@@ -2015,12 +2083,72 @@ static void CreateControls(HWND hwnd) {
     SendMessageW(combo, CB_SETCURSEL, def - 1, 0);
 }
 
+/* Lay out the toolbar, address row, file list, and status bar for the current
+ * client size. Called on every WM_SIZE. */
+static void LayoutMain(HWND hwnd) {
+    if (!g_toolbar || !g_status) return;
+    SendMessageW(g_status, WM_SIZE, 0, 0);   /* re-dock the status bar to bottom */
+
+    RECT rc; GetClientRect(hwnd, &rc);
+    SIZE ts; SendMessageW(g_toolbar, TB_GETMAXSIZE, 0, (LPARAM)&ts);
+    int tbH = ts.cy + S(6);
+    MoveWindow(g_toolbar, 0, 0, rc.right, tbH, TRUE);
+
+    RECT sbr; GetWindowRect(g_status, &sbr);
+    int sbH = sbr.bottom - sbr.top;
+
+    int pad = S(8), rowH = S(23), rowY = tbH + S(5);
+
+    /* Right cluster on the address row: [ Self-extracting .exe ] [CPU:] [combo] */
+    int cx = rc.right - pad;
+    int comboW = S(52); cx -= comboW; int comboX = cx;
+    cx -= S(4);
+    int cpuW = S(30);   cx -= cpuW;   int cpuX = cx;
+    cx -= S(12);
+    int sfxW = S(150);  cx -= sfxW;   int sfxX = cx;
+    int pathRight = cx - S(12);
+
+    MoveWindow(GetDlgItem(hwnd, IDC_SFX_CHECK), sfxX,   rowY, sfxW,   rowH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDC_CPU_LABEL), cpuX,   rowY, cpuW,   rowH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDC_CPU_COMBO), comboX, rowY, comboW, S(200), TRUE);
+
+    int locW = S(56);
+    MoveWindow(GetDlgItem(hwnd, IDC_LOC_LABEL), pad, rowY, locW, rowH, TRUE);
+    int pathX = pad + locW + S(4);
+    int pathW = pathRight - pathX; if (pathW < S(60)) pathW = S(60);
+    MoveWindow(GetDlgItem(hwnd, IDC_PATH_STATIC), pathX, rowY, pathW, rowH, TRUE);
+
+    int listY = rowY + rowH + S(6);
+    int listH = rc.bottom - sbH - listY; if (listH < 0) listH = 0;
+    MoveWindow(g_list, pad, listY, rc.right - 2 * pad, listH, TRUE);
+    MoveWindow(g_hint, pad, listY + S(40), rc.right - 2 * pad,
+               listH > S(80) ? listH - S(80) : listH, TRUE);
+
+    /* Status-bar parts: [ status text | progress | counts ]. */
+    int parts[3];
+    parts[0] = rc.right - S(280); if (parts[0] < S(80)) parts[0] = S(80);
+    parts[1] = rc.right - S(120); if (parts[1] < parts[0] + S(40)) parts[1] = parts[0] + S(40);
+    parts[2] = -1;
+    SendMessageW(g_status, SB_SETPARTS, 3, (LPARAM)parts);
+    RECT prc; SendMessageW(g_status, SB_GETRECT, 1, (LPARAM)&prc);
+    MoveWindow(g_progress, prc.left + S(2), prc.top + S(2),
+               (prc.right - prc.left) - S(4), (prc.bottom - prc.top) - S(4), TRUE);
+}
+
 static HMENU BuildMenu(void) {
     HMENU file = CreatePopupMenu();
-    AppendMenuW(file, MF_STRING, IDM_OPEN, L"&Open file…\tCtrl+O");
-    AppendMenuW(file, MF_STRING, IDM_OPENFOLDER, L"Open &folder…");
+    AppendMenuW(file, MF_STRING, IDM_OPEN, L"&Open archive…\tCtrl+O");
+    AppendMenuW(file, MF_STRING, IDM_COMPRESS_FILE,   L"Compress &file…");
+    AppendMenuW(file, MF_STRING, IDM_COMPRESS_FOLDER, L"Compress f&older…");
+    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(file, MF_STRING, IDM_CLOSE_ARCHIVE, L"&Close archive");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, IDM_EXIT, L"E&xit");
+    HMENU archive = CreatePopupMenu();
+    AppendMenuW(archive, MF_STRING, IDM_EXTRACT,     L"&Extract selected…");
+    AppendMenuW(archive, MF_STRING, IDM_EXTRACT_ALL, L"Extract &all…");
+    AppendMenuW(archive, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(archive, MF_STRING, IDM_UP,          L"&Up one level\tBackspace");
     HMENU tools = CreatePopupMenu();
     AppendMenuW(tools, MF_STRING, IDM_REGISTER,
                 L"&Install Explorer context menu");
@@ -2029,10 +2157,24 @@ static HMENU BuildMenu(void) {
     HMENU help = CreatePopupMenu();
     AppendMenuW(help, MF_STRING, IDM_ABOUT, L"&About WinSquish");
     HMENU bar = CreateMenu();
-    AppendMenuW(bar, MF_POPUP, (UINT_PTR)file,  L"&File");
-    AppendMenuW(bar, MF_POPUP, (UINT_PTR)tools, L"&Tools");
-    AppendMenuW(bar, MF_POPUP, (UINT_PTR)help,  L"&Help");
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)file,    L"&File");
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)archive, L"&Archive");
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)tools,   L"&Tools");
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)help,    L"&Help");
     return bar;
+}
+
+/* Route a dropped path: an archive/stream opens in the browser; anything else
+ * (a plain file or a folder) is compressed. */
+static void HandleDrop(const std::wstring &p) {
+    if (g_busy) return;
+    if (IsDirectory(p)) { g_source = p; StartJob(true, g_source); return; }
+    if (FileSize(p) < 0) return;
+    SfxInfo si;
+    bool sfx = ProbeSfx(p, &si);
+    char kind = ProbePayloadKind(p, sfx ? si.payloadOff : 0);
+    if (kind) BrowsePath(p);
+    else { g_source = p; StartJob(true, g_source); }
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -2041,32 +2183,44 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_hwnd = hwnd;
         CreateControls(hwnd);
         DragAcceptFiles(hwnd, TRUE);
+        UpdateChrome();               /* start in the empty state */
         return 0;
 
+    case WM_SIZE:
+        LayoutMain(hwnd);
+        return 0;
+
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO *mm = (MINMAXINFO *)lp;
+        mm->ptMinTrackSize.x = S(600);
+        mm->ptMinTrackSize.y = S(380);
+        return 0;
+    }
+
     case WM_DROPFILES: {
-        if (g_busy) break;
         wchar_t path[MAX_PATH];
-        if (DragQueryFileW((HDROP)wp, 0, path, MAX_PATH)) {
-            SetDlgItemTextW(hwnd, IDC_FILE_EDIT, path);
-            UpdateFileInfo();
-        }
+        if (!g_busy && DragQueryFileW((HDROP)wp, 0, path, MAX_PATH))
+            HandleDrop(path);
         DragFinish((HDROP)wp);
         return 0;
     }
 
     case WM_COMMAND:
         switch (LOWORD(wp)) {
-        case IDC_BROWSE_BTN:
-        case IDM_OPEN:         BrowseFile();                       return 0;
-        case IDM_OPENFOLDER:   BrowseFolder();                     return 0;
-        case IDC_COMPRESS_BTN: StartJob(true);                     return 0;
-        case IDC_EXTRACT_BTN:  StartJob(false);                    return 0;
-        case IDC_VIEW_BTN:     StartView();                        return 0;
-        case IDC_SFX_CHECK:
-            if (HIWORD(wp) == BN_CLICKED) UpdateFileInfo();
+        case IDM_OPEN:            OpenArchiveDialog();               return 0;
+        case IDM_COMPRESS:        /* toolbar main click without dropdown */
+        case IDM_COMPRESS_FILE:   CompressFileDialog();              return 0;
+        case IDM_COMPRESS_FOLDER: CompressFolderDialog();            return 0;
+        case IDM_EXTRACT:
+            if (g_browser) ExtractSelection(g_browser, false);       return 0;
+        case IDM_EXTRACT_ALL:
+            if (g_browser) ExtractSelection(g_browser, true);        return 0;
+        case IDM_UP:
+            if (g_browser) NavigateTo(g_browser, ParentCwd(g_browser->cwd));
             return 0;
-        case IDC_FILE_EDIT:
-            if (HIWORD(wp) == EN_KILLFOCUS) UpdateFileInfo();
+        case IDM_CLOSE_ARCHIVE:   CloseArchive();                    return 0;
+        case IDC_SFX_CHECK:
+            if (HIWORD(wp) == BN_CLICKED) RefreshSourceStatus();
             return 0;
         case IDM_REGISTER:
             /* The GUI registers per-user (HKCU): no elevation needed. */
@@ -2088,12 +2242,61 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
 
+    case WM_NOTIFY: {
+        NMHDR *nh = (NMHDR *)lp;
+        /* Toolbar "Compress" dropdown: choose file vs. folder. */
+        if (nh->idFrom == IDC_TOOLBAR && nh->code == TBN_DROPDOWN) {
+            NMTOOLBARW *tb = (NMTOOLBARW *)lp;
+            if (tb->iItem == IDM_COMPRESS && !g_busy) {
+                RECT rb; SendMessageW(g_toolbar, TB_GETRECT, IDM_COMPRESS, (LPARAM)&rb);
+                MapWindowPoints(g_toolbar, HWND_DESKTOP, (POINT *)&rb, 2);
+                HMENU m = CreatePopupMenu();
+                AppendMenuW(m, MF_STRING, IDM_COMPRESS_FILE,   L"Compress File…");
+                AppendMenuW(m, MF_STRING, IDM_COMPRESS_FOLDER, L"Compress Folder…");
+                TrackPopupMenu(m, TPM_LEFTALIGN | TPM_TOPALIGN,
+                               rb.left, rb.bottom, 0, hwnd, nullptr);
+                DestroyMenu(m);
+            }
+            return TBDDRET_DEFAULT;
+        }
+        /* File-list interactions, forwarded to the open archive. */
+        if (nh->idFrom == IDC_LV && g_browser) {
+            Browser *b = g_browser;
+            switch (nh->code) {
+            case LVN_ITEMACTIVATE: {
+                NMITEMACTIVATE *ia = (NMITEMACTIVATE *)lp;
+                if (ia->iItem >= 0) ActivateRow(b, ia->iItem);
+                return 0;
+            }
+            case LVN_KEYDOWN: {
+                NMLVKEYDOWN *kd = (NMLVKEYDOWN *)lp;
+                if (kd->wVKey == VK_BACK) {
+                    NavigateTo(b, ParentCwd(b->cwd)); return 0;
+                }
+                break;
+            }
+            case LVN_COLUMNCLICK: {
+                NMLISTVIEW *nl = (NMLISTVIEW *)lp;
+                if (nl->iSubItem == b->sortCol) b->sortAsc = !b->sortAsc;
+                else { b->sortCol = nl->iSubItem; b->sortAsc = true; }
+                BuildView(b); FillList(b); UpdateChrome();
+                return 0;
+            }
+            case LVN_ITEMCHANGED:
+                UpdateChrome();
+                return 0;
+            }
+        }
+        break;
+    }
+
     case WM_APP_PROGRESS:
-        SendDlgItemMessageW(hwnd, IDC_PROGRESS, PBM_SETPOS, wp, 0);
+        SendMessageW(g_progress, PBM_SETPOS, wp, 0);
         {
             const wchar_t *verb = L"Compressing…";
             if (g_job) {
-                if (!g_job->compress)    verb = L"Extracting…";
+                if (g_job->listing)      verb = L"Reading…";
+                else if (!g_job->compress) verb = L"Extracting…";
                 else if (g_job->sfx)     verb = L"Building…";
             }
             wchar_t s[64];
@@ -2116,6 +2319,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_DESTROY:
+        if (g_browser) {
+            if (g_browser->arc) squish_archive_close(g_browser->arc);
+            delete g_browser;
+            g_browser = nullptr;
+        }
+        if (g_tbImages) { ImageList_Destroy(g_tbImages); g_tbImages = nullptr; }
         PostQuitMessage(0);
         return 0;
     }
@@ -2175,8 +2384,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     INITCOMMONCONTROLSEX icc = { sizeof icc,
-        ICC_PROGRESS_CLASS | ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES };
+        ICC_PROGRESS_CLASS | ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES |
+        ICC_BAR_CLASSES };
     InitCommonControlsEx(&icc);
+
+    Gdiplus::GdiplusStartupInput gdipIn;
+    Gdiplus::GdiplusStartup(&g_gdipToken, &gdipIn, nullptr);
 
     g_dpi = GetDpiForSystem();
     NONCLIENTMETRICSW ncm = { sizeof ncm };
@@ -2193,26 +2406,35 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
     wc.lpszClassName = WND_CLASS;
     RegisterClassExW(&wc);
 
-    RECT r = { 0, 0, S(488), S(214) };
-    AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
-                         WS_MINIMIZEBOX, TRUE);
-    HWND hwnd = CreateWindowExW(0, WND_CLASS, APP_NAME,
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+    RECT r = { 0, 0, S(940), S(600) };
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, TRUE);
+    HWND hwnd = CreateWindowExW(WS_EX_ACCEPTFILES, WND_CLASS, APP_NAME,
+        WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         r.right - r.left, r.bottom - r.top,
         nullptr, BuildMenu(), hInst, nullptr);
     ShowWindow(hwnd, nCmdShow);
+    UpdateWindow(hwnd);
 
     if (!file.empty()) {
         if (autoMode == 3) CheckDlgButton(hwnd, IDC_SFX_CHECK, BST_CHECKED);
-        SetDlgItemTextW(hwnd, IDC_FILE_EDIT, file.c_str());
-        UpdateFileInfo();
-        if (autoMode == 1 || autoMode == 3)
-            PostMessageW(hwnd, WM_COMMAND, IDC_COMPRESS_BTN, 0);
-        if (autoMode == 2)
-            PostMessageW(hwnd, WM_COMMAND, IDC_EXTRACT_BTN, 0);
-        if (autoMode == 4)
-            PostMessageW(hwnd, WM_COMMAND, IDC_VIEW_BTN, 0);
+        if (autoMode == 1 || autoMode == 3) {
+            g_source = file;
+            StartJob(true, file);               /* compress (.sq or SFX)      */
+        } else if (autoMode == 2) {
+            StartJob(false, file);              /* extract straight to disk   */
+        } else if (autoMode == 4) {
+            BrowsePath(file);                   /* browse the archive         */
+        } else {
+            /* A bare path: browse it if it is an archive, else queue it for
+             * compression so the toolbar's Compress acts on it. */
+            SfxInfo si;
+            bool sfx = ProbeSfx(file, &si);
+            char kind = IsDirectory(file) ? 0
+                      : ProbePayloadKind(file, sfx ? si.payloadOff : 0);
+            if (kind) BrowsePath(file);
+            else { g_source = file; RefreshSourceStatus(); }
+        }
     }
 
     MSG msg;
@@ -2223,5 +2445,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
         }
     }
     DeleteObject(g_font);
+    Gdiplus::GdiplusShutdown(g_gdipToken);
     return (int)msg.wParam;
 }

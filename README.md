@@ -9,34 +9,37 @@ context-mixing compressor, with Explorer right-click integration.
 
 ## Features
 
-- **GUI**: pick or drag-and-drop a **file or a folder**, then **Compress**
-  (to `.sq`) or **Extract**, with a live progress bar. Shows the original size
-  stored in a `.sq` stream's header before you extract.
-- **Folders / seekable archives**: drop a folder (or use **File ▸ Open
-  folder…**) and Compress packs the whole tree into a single `.sq` in SQUISH's
-  seekable **`SQAR02`** archive format — each file is compressed as its own
-  stream behind a compact index, so a reader can list members and pull out one
-  file or subtree by seeking straight to it, without inflating the rest. Folder
-  archives interoperate byte-for-byte with the `squish` CLI (`c`/`l`/`x`/`d`)
-  in both directions. Extracting such a `.sq` recreates the directory tree
-  (empty directories and all); extracting a single-file `.sq` writes the file —
+- **GUI (WinZip/PeaZip-style)**: one large, resizable window with a toolbar
+  (**Open**, **Compress**, **Extract**, **Up**), an address bar, a central file
+  list, and a status bar. **Open** browses an existing archive; **Compress ▸
+  File… / Folder…** packs a chosen file or folder into a new `.sq`; or just drag
+  a file, folder, or archive onto the window. Live progress shows in the status
+  bar, and compressing a folder opens the resulting archive in the list.
+- **Folders / seekable archives**: **Compress ▸ Folder…** (or dropping a folder)
+  packs the whole tree into a single `.sq` in SQUISH's seekable **`SQAR02`**
+  archive format — each file is compressed as its own stream behind a compact
+  index, so a reader can list members and pull out one file or subtree by
+  seeking straight to it, without inflating the rest. Folder archives
+  interoperate byte-for-byte with the `squish` CLI (`c`/`l`/`x`/`d`) in both
+  directions. Extracting such a `.sq` recreates the directory tree (empty
+  directories and all); extracting a single-file `.sq` writes the file —
   WinSquish detects which it is automatically.
-- **Browse an archive (WinRAR-style)**: click **View Files…** (or run
-  `winsquish.exe --view <archive>`) to open a `.sq` or self-extracting `.exe`
-  in a browsable window. A seekable archive opens **instantly** — only its
-  header and index are read. Open folders to descend (single- or double-click,
-  per your Windows setting, or Enter), **Up** / Backspace to ascend, and sort
-  by name or size. **Extract Selected…** files or folders — or **Extract
-  All…** — where a single selected file opens a **Save As** dialog (choose the
-  folder *and* the filename) and any other selection asks for a destination
-  folder, with the archive's directory structure preserved. Each file is
+- **Browse an archive**: click **Open** (or run `winsquish.exe --view
+  <archive>`, or double-click a `.sq`) to load a `.sq` or self-extracting `.exe`
+  into the file list. A seekable archive opens **instantly** — only its header
+  and index are read. Open folders to descend (single- or double-click, per your
+  Windows setting, or Enter), **Up** / Backspace to ascend, and sort by name or
+  size. **Extract** the current selection — or **Archive ▸ Extract all…** —
+  where a single selected file opens a **Save As** dialog (choose the folder
+  *and* the filename) and any other selection asks for a destination folder,
+  with the archive's directory structure preserved. Each file is
   inflated on demand by seeking straight to its own stream, so pulling a few
   files out of a huge archive never decompresses the whole thing. Overwriting
   an existing file is confirmed first (with an "apply to all" option).
   Directory archives written by *older* WinSquish builds (a solid `SQAR01`
   stream, no random access) still browse and extract too — they're decompressed
   whole first (with a progress bar), then presented the same way.
-- **Self-extracting archives (SFX)**: tick **Create self-extracting archive**
+- **Self-extracting archives (SFX)**: tick **Self-extracting .exe**
   and Compress produces a Windows `.exe` instead of a `.sq` — WinSquish itself
   is the stub, so double-clicking that `.exe` extracts the payload beside it,
   no WinSquish install required on the other machine. **Extract** also opens
