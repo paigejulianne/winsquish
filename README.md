@@ -75,7 +75,7 @@ The build signs everything with
 the app binaries (`WinSquish.exe`, `WinSquish.dll`, `squish.dll`) **and** the
 installer plus its embedded uninstaller, SHA-256 and RFC-3161 timestamped.
 
-Signing is driven by `installer\sign.ps1` — a wrapper around the
+Signing is driven by `installer\sign.bat` — a wrapper around the
 [`sign`](https://github.com/dotnet/sign) dotnet tool — and turns on
 automatically whenever `installer\signer.json` is present. That file holds the
 Trusted Signing account details; they are **identifiers only, no secrets**, so
@@ -109,7 +109,7 @@ Any `SIGN_ENDPOINT`, `SIGN_ACCOUNT`, `SIGN_CERTIFICATE_PROFILE`, or
 `SIGN_TIMESTAMP_URL` environment variable overrides the matching `signer.json`
 field (handy in CI). To build **without** signing — e.g. a contributor without
 access to the signing account — remove or rename `installer\signer.json` and
-the build skips signing entirely. See `installer\sign.ps1` for the full
+the build skips signing entirely. See `installer\sign.bat` for the full
 contract.
 
 ## Requirements
@@ -163,7 +163,7 @@ src/
 installer/
   winsquish.iss       Inno Setup script (per-user / all-users)
   build-installer.bat publish + compile the installer
-  sign.ps1            Azure Trusted Signing wrapper (the 'sign' tool)
+  sign.bat            Azure Trusted Signing wrapper (the 'sign' tool)
   signer.json         Trusted Signing account details (identifiers, no secrets)
 ```
 

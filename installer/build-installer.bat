@@ -36,13 +36,13 @@ if not exist "%PUBLISH%\squish.dll" (
 )
 
 REM --- Optional Azure Trusted Signing ------------------------------------
-REM Enabled when a signer is configured (see installer\sign.ps1): the
+REM Enabled when a signer is configured (see installer\sign.bat): the
 REM committed installer\signer.json, or SIGN_ENDPOINT/SIGN_ACCOUNT/
 REM SIGN_CERTIFICATE_PROFILE in the environment. Signing authenticates with
 REM your Azure credentials (locally: 'az login'; CI: AZURE_* env vars).
 REM When enabled we sign our own binaries here, and hand the same signer to
 REM Inno so it signs the installer and its embedded uninstaller too.
-set "SIGNPS1=%SCRIPT_DIR%sign.ps1"
+set "SIGNBAT=%SCRIPT_DIR%sign.bat"
 set "DO_SIGN="
 if exist "%SCRIPT_DIR%signer.json"  set "DO_SIGN=1"
 if defined SIGN_ENDPOINT            set "DO_SIGN=1"
@@ -52,9 +52,9 @@ if defined SIGN_CERTIFICATE_PROFILE set "DO_SIGN=1"
 set "ISCC_SIGN_FLAGS="
 if defined DO_SIGN (
     echo Signing application binaries with Azure Trusted Signing ...
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%SIGNPS1%" "%PUBLISH%\WinSquish.exe" "%PUBLISH%\WinSquish.dll" "%PUBLISH%\squish.dll"
+    call "%SIGNBAT%" "%PUBLISH%\WinSquish.exe" "%PUBLISH%\WinSquish.dll" "%PUBLISH%\squish.dll"
     if errorlevel 1 exit /b 1
-    set "ISCC_SIGN_FLAGS=/DSign "/Swinsquishsign=powershell.exe -NoProfile -ExecutionPolicy Bypass -File $q%SIGNPS1%$q $f""
+    set "ISCC_SIGN_FLAGS=/DSign "/Swinsquishsign=cmd.exe /c $q$q%SIGNBAT%$q $f$q""
 ) else (
     echo No signer configured ^(add installer\signer.json or set SIGN_ENDPOINT/SIGN_ACCOUNT/SIGN_CERTIFICATE_PROFILE^); skipping code signing.
 )

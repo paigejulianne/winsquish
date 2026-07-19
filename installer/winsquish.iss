@@ -59,7 +59,7 @@ MinVersion=10.0
 CloseApplications=yes
 RestartApplications=no
 ; Authenticode signing via Azure Trusted Signing. build-installer.bat passes
-; /DSign and defines the "winsquishsign" SignTool (a sign.ps1 wrapper around
+; /DSign and defines the "winsquishsign" SignTool (a sign.bat wrapper around
 ; the 'sign' tool) when a signer is configured; without it the installer builds
 ; unsigned. SignedUninstaller makes Inno sign the uninstaller it embeds, too.
 #ifdef Sign
