@@ -416,9 +416,8 @@ public sealed class MainViewModel : ObservableObject
 
     /// <summary>
     /// Add dropped files/folders to the open archive at the current folder.
-    /// libsquish can't mutate an archive in place, so this extracts the whole
-    /// archive to a temp tree, merges the new items in, recompresses (reusing
-    /// the archive's block size), then swaps the result over the original.
+    /// Uses libsquish's in-place merge: existing members are copied verbatim and
+    /// only the added files are compressed — no full re-pack.
     /// </summary>
     public async Task AddPathsAsync(IReadOnlyList<string> paths)
     {
@@ -429,6 +428,8 @@ public sealed class MainViewModel : ObservableObject
 
         var targetFolder = CurrentFolder ?? _root;
         string prefix = targetFolder.FullPath;          // "" for the root
+        string archivePath = _archive.ArchivePath;
+        string archiveName = Path.GetFileName(archivePath);
 
         // Existing file paths, for collision detection (case-insensitive, '/'-separated).
         var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -437,7 +438,7 @@ public sealed class MainViewModel : ObservableObject
 
         // Resolve each dropped item to its destination path inside the archive,
         // and collect the files that would land on an existing entry.
-        var items = new List<(string Src, bool IsDir, string Dest)>();
+        var items = new List<(string Src, string Dest)>();
         var conflicts = new List<string>();
         foreach (var src in sources)
         {
@@ -445,10 +446,9 @@ public sealed class MainViewModel : ObservableObject
             string name = Path.GetFileName(trimmed);
             if (string.IsNullOrEmpty(name)) continue;   // e.g. a drive root
             string dest = string.IsNullOrEmpty(prefix) ? name : $"{prefix}/{name}";
-            bool isDir = Directory.Exists(src);
-            items.Add((src, isDir, dest));
+            items.Add((src, dest));
 
-            if (isDir)
+            if (Directory.Exists(src))
             {
                 foreach (var f in Directory.EnumerateFiles(src, "*", SearchOption.AllDirectories))
                 {
@@ -474,35 +474,39 @@ public sealed class MainViewModel : ObservableObject
             if (choice == MessageBoxResult.Cancel) return;
             overwrite = choice == MessageBoxResult.Yes;
         }
+        bool keepExisting = !overwrite;
 
-        var skip = overwrite
-            ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            : new HashSet<string>(conflicts, StringComparer.OrdinalIgnoreCase);
-
-        // If nothing new survives a "keep existing" choice, there's no work to do.
-        if (!overwrite && CountWritable(items, skip) == 0)
+        try
         {
-            Status = "Nothing to add — every dropped file already exists in the archive.";
-            return;
-        }
+            // Release our read handle so libsquish can replace the file on disk.
+            _archive.Dispose();
+            _archive = null;
 
-        string archiveName = Path.GetFileName(_archive.ArchivePath);
-        await RebuildArchiveAsync(
-            $"Adding {items.Count} item(s) to {archiveName}…", prefix,
-            $"Added {items.Count} item(s) to {archiveName}", "Could not add files",
-            staging =>
-            {
-                foreach (var it in items)
+            await RunBusyAsync(
+                $"Adding {items.Count} item(s) to {archiveName}…",
+                progress => Task.Run(() =>
                 {
-                    string osDest = Path.Combine(
-                        staging, it.Dest.Replace('/', Path.DirectorySeparatorChar));
-                    if (it.IsDir) CopyTree(it.Src, osDest, it.Dest, skip);
-                    else CopyFileInto(it.Src, osDest, it.Dest, skip);
-                }
-            });
+                    foreach (var it in items)
+                        SquishArchive.Add(archivePath, it.Src, it.Dest, keepExisting,
+                            threads: 0, progress: (d, t) => progress(d, t == 0 ? 1 : t));
+                }));
+
+            await LoadArchiveAsync(archivePath);
+            NavigateToPath(prefix);
+            Status = $"Added {items.Count} item(s) to {archiveName}";
+        }
+        catch (Exception ex)
+        {
+            Fail("Could not add files", ex);
+            if (_archive is null && File.Exists(archivePath))
+                await LoadArchiveAsync(archivePath);
+        }
     }
 
-    /// <summary>Delete the selected files/folders from the archive (rebuilds it).</summary>
+    /// <summary>
+    /// Delete the selected files/folders from the archive. Uses libsquish's
+    /// in-place remove: survivors are copied verbatim, nothing is recompressed.
+    /// </summary>
     public async Task DeleteSelectedAsync()
     {
         if (_archive is null || _root is null || IsBusy) return;
@@ -512,117 +516,37 @@ public sealed class MainViewModel : ObservableObject
 
         string what = targets.Count == 1 ? $"“{targets[0].Name}”" : $"{targets.Count} items";
         if (MessageBox.Show(
-                $"Delete {what} from the archive?\n\n" +
-                "The archive is rebuilt without the selected item(s); this can't be undone.",
+                $"Delete {what} from the archive?\n\nThis can't be undone.",
                 "Delete from archive", MessageBoxButton.YesNo, MessageBoxImage.Warning)
             != MessageBoxResult.Yes)
             return;
 
-        // Snapshot removal paths and the return folder before the tree is rebuilt.
         var relPaths = targets.Select(n => n.FullPath).ToList();
         string reopenPrefix = (CurrentFolder ?? _root).FullPath;
-        string name = Path.GetFileName(_archive.ArchivePath);
-        int count = targets.Count;
-
-        await RebuildArchiveAsync(
-            $"Deleting {count} item(s) from {name}…", reopenPrefix,
-            $"Deleted {count} item(s) from {name}", "Could not delete",
-            staging =>
-            {
-                foreach (var rel in relPaths)
-                {
-                    string os = Path.Combine(staging, rel.Replace('/', Path.DirectorySeparatorChar));
-                    if (Directory.Exists(os)) Directory.Delete(os, recursive: true);
-                    else if (File.Exists(os)) File.Delete(os);
-                }
-            });
-    }
-
-    /// <summary>
-    /// Rebuild the open archive around a staging-tree mutation: extract it to a
-    /// temp tree, run <paramref name="mutate"/> over that tree, recompress (keeping
-    /// the block size), swap the result over the original, then reopen at
-    /// <paramref name="reopenPrefix"/>. The extract→recompress runs off the UI
-    /// thread under the busy overlay; on any failure the original is left intact.
-    /// </summary>
-    private async Task RebuildArchiveAsync(
-        string busyTitle, string reopenPrefix, string successStatus, string failWhat,
-        Action<string> mutate)
-    {
-        if (_archive is null) return;
         string archivePath = _archive.ArchivePath;
-        ulong chunk = _archive.Info.ChunkSize;
-        string staging = Path.Combine(
-            Path.GetTempPath(), "WinSquish", "rebuild", Guid.NewGuid().ToString("N")[..8]);
-        string tmpArchive = archivePath + ".winsquish-tmp";
+        string archiveName = Path.GetFileName(archivePath);
+        int count = targets.Count;
 
         try
         {
-            await RunBusyAsync(busyTitle, progress => Task.Run(() =>
-            {
-                Directory.CreateDirectory(staging);
-                _archive!.ExtractSubtree(null, staging, (d, t) => progress(d, t == 0 ? 1 : t));
-                mutate(staging);
-                SquishArchive.Create(staging, tmpArchive, threads: 0, chunkSize: (nuint)chunk,
-                    (d, t) => progress(d, t == 0 ? 1 : t));
-            }));
-
-            // Release the read handle on the original, then swap the rebuilt one in.
-            _archive!.Dispose();
+            _archive.Dispose();
             _archive = null;
-            File.Move(tmpArchive, archivePath, overwrite: true);
+
+            await RunBusyAsync(
+                $"Deleting {count} item(s) from {archiveName}…",
+                progress => Task.Run(() =>
+                    SquishArchive.Remove(archivePath, relPaths,
+                        (d, t) => progress(d, t == 0 ? 1 : t))));
 
             await LoadArchiveAsync(archivePath);
             NavigateToPath(reopenPrefix);
-            Status = successStatus;
+            Status = $"Deleted {count} item(s) from {archiveName}";
         }
         catch (Exception ex)
         {
-            Fail(failWhat, ex);
-            // If we closed the original but the swap failed, reopen what's on disk.
+            Fail("Could not delete", ex);
             if (_archive is null && File.Exists(archivePath))
                 await LoadArchiveAsync(archivePath);
-        }
-        finally
-        {
-            TryDeleteDir(staging);
-            TryDeleteFile(tmpArchive);
-        }
-    }
-
-    private static int CountWritable(
-        List<(string Src, bool IsDir, string Dest)> items, HashSet<string> skip)
-    {
-        int n = 0;
-        foreach (var it in items)
-        {
-            if (it.IsDir)
-                foreach (var f in Directory.EnumerateFiles(it.Src, "*", SearchOption.AllDirectories))
-                {
-                    string d = $"{it.Dest}/{Path.GetRelativePath(it.Src, f).Replace('\\', '/')}";
-                    if (!skip.Contains(d)) n++;
-                }
-            else if (!skip.Contains(it.Dest)) n++;
-        }
-        return n;
-    }
-
-    private static void CopyFileInto(string src, string osDest, string archDest, HashSet<string> skip)
-    {
-        if (skip.Contains(archDest)) return;
-        Directory.CreateDirectory(Path.GetDirectoryName(osDest)!);
-        File.Copy(src, osDest, overwrite: true);
-    }
-
-    private static void CopyTree(string srcDir, string osDestDir, string archPrefix, HashSet<string> skip)
-    {
-        foreach (var f in Directory.EnumerateFiles(srcDir, "*", SearchOption.AllDirectories))
-        {
-            string rel = Path.GetRelativePath(srcDir, f);
-            if (skip.Contains($"{archPrefix}/{rel.Replace('\\', '/')}")) continue;
-            string osDest = Path.Combine(osDestDir, rel);
-            Directory.CreateDirectory(Path.GetDirectoryName(osDest)!);
-            File.Copy(f, osDest, overwrite: true);
         }
     }
 
@@ -641,12 +565,6 @@ public sealed class MainViewModel : ObservableObject
                 if (FindFolder(c, fullPath) is { } hit) return hit;
         return null;
     }
-
-    private static void TryDeleteDir(string dir)
-    { try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); } catch { /* temp */ } }
-
-    private static void TryDeleteFile(string file)
-    { try { if (File.Exists(file)) File.Delete(file); } catch { /* temp */ } }
 
     // --- command-line startup actions ------------------------------------
 

@@ -140,6 +140,22 @@ internal static class SquishNative
         int nthreads, nuint chunkSize,
         SquishProgressFn? cb, IntPtr user);
 
+    // --- editing ---------------------------------------------------------
+    [DllImport(Dll, CallingConvention = Cc)]
+    public static extern int squish_archive_add(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string archivePath,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string srcPath,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string arcPath,
+        int nthreads, uint flags,
+        SquishProgressFn? cb, IntPtr user);
+
+    // paths is a pinned array of UTF-8 char* (const char *const *).
+    [DllImport(Dll, CallingConvention = Cc)]
+    public static extern int squish_archive_remove(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string archivePath,
+        IntPtr paths, nuint npaths,
+        SquishProgressFn? cb, IntPtr user);
+
     // --- helpers ---------------------------------------------------------
     public static string Version() => Marshal.PtrToStringUTF8(squish_version()) ?? "?";
 

@@ -190,6 +190,65 @@ public sealed class SquishArchive : IDisposable
         GC.KeepAlive(cb);
     }
 
+    /// <summary>
+    /// Add (merge) a file or directory tree into an existing archive under
+    /// <paramref name="arcPath"/> ('/'-separated). Existing members are copied
+    /// verbatim — only the added files are compressed. Colliding files are
+    /// overwritten unless <paramref name="keepExisting"/>. The archive at
+    /// <paramref name="archivePath"/> is rewritten in place (atomic swap), so no
+    /// reader handle to it may be open. <paramref name="threads"/> 0 = all cores.
+    /// </summary>
+    public static void Add(
+        string archivePath, string srcPath, string arcPath, bool keepExisting = false,
+        int threads = 0, Action<ulong, ulong>? progress = null)
+    {
+        SquishProgressFn? cb = progress is null
+            ? null
+            : (processed, total, _) => progress(processed, total);
+
+        uint flags = keepExisting ? 1u : 0u;   // SQUISH_ADD_KEEP_EXISTING
+        SquishException.Check(
+            SquishNative.squish_archive_add(archivePath, srcPath, arcPath, threads, flags, cb, IntPtr.Zero),
+            $"add '{arcPath}'");
+        GC.KeepAlive(cb);
+    }
+
+    /// <summary>
+    /// Remove members (each an exact path or a subtree root) from an existing
+    /// archive. Survivors are copied verbatim; nothing is recompressed. Rewrites
+    /// the archive in place, so no reader handle to it may be open.
+    /// </summary>
+    public static void Remove(
+        string archivePath, IReadOnlyList<string> paths, Action<ulong, ulong>? progress = null)
+    {
+        if (paths.Count == 0) return;
+
+        SquishProgressFn? cb = progress is null
+            ? null
+            : (processed, total, _) => progress(processed, total);
+
+        // Marshal the paths as a native array of UTF-8 char* and pin it.
+        var ptrs = new IntPtr[paths.Count];
+        var pin = default(GCHandle);
+        try
+        {
+            for (int i = 0; i < paths.Count; i++)
+                ptrs[i] = Marshal.StringToCoTaskMemUTF8(paths[i]);
+            pin = GCHandle.Alloc(ptrs, GCHandleType.Pinned);
+            SquishException.Check(
+                SquishNative.squish_archive_remove(
+                    archivePath, pin.AddrOfPinnedObject(), (nuint)paths.Count, cb, IntPtr.Zero),
+                "remove from archive");
+        }
+        finally
+        {
+            if (pin.IsAllocated) pin.Free();
+            foreach (var p in ptrs)
+                if (p != IntPtr.Zero) Marshal.FreeCoTaskMem(p);   // frees StringToCoTaskMemUTF8
+        }
+        GC.KeepAlive(cb);
+    }
+
     /// <summary>Cheap sniff: are the first bytes of this file a SQUISH archive?</summary>
     public static bool Probe(string path)
     {
