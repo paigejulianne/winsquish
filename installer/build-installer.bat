@@ -23,13 +23,17 @@ if not exist "%PUBLISH%\squish.dll" (
     exit /b 1
 )
 
-REM Locate ISCC (Inno Setup 6).
+REM Locate ISCC (Inno Setup 7 or 6).
 set "ISCC="
-if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
-if not defined ISCC if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles%\Inno Setup 6\ISCC.exe"
+for %%D in (
+    "%ProgramFiles%\Inno Setup 7"
+    "%ProgramFiles(x86)%\Inno Setup 7"
+    "%ProgramFiles%\Inno Setup 6"
+    "%ProgramFiles(x86)%\Inno Setup 6"
+) do if not defined ISCC if exist "%%~D\ISCC.exe" set "ISCC=%%~D\ISCC.exe"
 
 if not defined ISCC (
-    echo ERROR: Inno Setup 6 ^(ISCC.exe^) not found. Install it from https://jrsoftware.org/isdl.php>&2
+    echo ERROR: Inno Setup ^(ISCC.exe^) not found. Install it from https://jrsoftware.org/isdl.php>&2
     exit /b 1
 )
 
