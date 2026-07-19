@@ -46,6 +46,8 @@
                 Command="{Binding OpenItemCommand}" ToolTip="Open the selected file with its default app" />
         <Button Style="{StaticResource ToolButton}" Tag="&#xE792;" Content="Save As"
                 Command="{Binding SaveAsCommand}" ToolTip="Save the selected file to disk" />
+        <Button Style="{StaticResource ToolButton}" Tag="&#xE74D;" Content="Delete"
+                Command="{Binding DeleteSelectedCommand}" ToolTip="Delete selected items from the archive (Del)" />
         <Separator Margin="6,4" Background="{StaticResource Border}" />
         <Button Style="{StaticResource ToolButton}" Tag="&#xE72C;" Content="Refresh"
                 Command="{Binding RefreshCommand}" ToolTip="Reload the archive (F5)" />
@@ -136,6 +138,9 @@
                                       RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
                   <MenuItem Header="Save As…"
                             Command="{Binding PlacementTarget.DataContext.SaveAsCommand,
+                                      RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                  <MenuItem Header="Delete" InputGestureText="Del"
+                            Command="{Binding PlacementTarget.DataContext.DeleteSelectedCommand,
                                       RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
                   <Separator />
                   <MenuItem Header="Select All" InputGestureText="Ctrl+A"

@@ -97,6 +97,12 @@ public partial class MainWindow : Window
             e.Handled = true;
             await ViewModel.ActivateAsync(node);
         }
+        else if (e.Key == Key.Delete)
+        {
+            e.Handled = true;
+            if (ViewModel.DeleteSelectedCommand.CanExecute(null))
+                ViewModel.DeleteSelectedCommand.Execute(null);
+        }
     }
 
     // --- breadcrumb: render buttons + chevrons from the VM's chain ---------
@@ -148,7 +154,13 @@ public partial class MainWindow : Window
 
     private async void OnDrop(object sender, DragEventArgs e)
     {
-        if (e.Data.GetData(DataFormats.FileDrop) is string[] { Length: > 0 } files)
+        if (e.Data.GetData(DataFormats.FileDrop) is not string[] { Length: > 0 } files) return;
+
+        // With an archive open, a drop adds the files to it (at the current folder);
+        // otherwise it opens the first dropped file as an archive.
+        if (ViewModel.IsArchiveOpen)
+            await ViewModel.AddPathsAsync(files);
+        else
             await ViewModel.LoadArchiveAsync(files[0]);
     }
 }
