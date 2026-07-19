@@ -19,11 +19,16 @@ if not exist "%SquishDll%" (
     exit /b 1
 )
 
+REM Clean prior output so stale files (e.g. an old single-file exe) aren't packaged.
+if exist "%PUBLISH%" rmdir /s /q "%PUBLISH%"
+
+REM NOTE: no PublishSingleFile - WPF's native interop throws DllNotFoundException
+REM from a single-file bundle. The installer packages the whole folder anyway.
 echo Publishing self-contained build to %PUBLISH% ...
-dotnet publish "%REPO%\src\WinSquish.csproj" -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o "%PUBLISH%" "-p:SquishDll=%SquishDll%"
+dotnet publish "%REPO%\src\WinSquish.csproj" -c Release -r win-x64 --self-contained -o "%PUBLISH%" "-p:SquishDll=%SquishDll%"
 if errorlevel 1 exit /b 1
 
-REM Single-file publish doesn't reliably stage loose native content, so copy it in.
+REM Make sure the native DLL is next to the exe, regardless of csproj resolution.
 copy /y "%SquishDll%" "%PUBLISH%\squish.dll" >nul
 if not exist "%PUBLISH%\squish.dll" (
     echo ERROR: failed to stage squish.dll into %PUBLISH%.>&2
