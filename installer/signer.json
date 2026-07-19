@@ -1,0 +1,7 @@
+{
+  "_comment": "Azure Trusted Signing details for WinSquish, read at build time by installer/sign.ps1 (which drives the 'sign' dotnet global tool). These are account identifiers, not secrets -- signing authenticates with your Azure credentials (locally: 'az login'; CI: AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_CLIENT_SECRET or a managed identity). Matching SIGN_* environment variables, if set, override these values.",
+  "endpoint": "https://eus.codesigning.azure.net/",
+  "account": "SullivanTechnology",
+  "certificateProfile": "Personal",
+  "timestampUrl": "http://timestamp.acs.microsoft.com/"
+}
