@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>WinSquish</RootNamespace>
+    <AssemblyName>WinSquish</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>assets\winsquish.ico</ApplicationIcon>
+
+    <!-- squish.dll is native x64, so the app must run as x64. -->
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+
+    <Version>1.0.0</Version>
+    <Product>WinSquish</Product>
+    <Description>A file-manager for SQUISH archives</Description>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <!--
+    The native SQUISH library. By default we look for it in the sibling
+    ../squish checkout; override with -p:SquishDll=path\to\squish.dll.
+  -->
+  <PropertyGroup>
+    <SquishDll Condition="'$(SquishDll)' == ''">$(MSBuildThisFileDirectory)..\..\squish\squish.dll</SquishDll>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Bundled so the window can show the icon and the title-bar/taskbar match. -->
+    <Resource Include="assets\winsquish.ico" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('$(SquishDll)')">
+    <Content Include="$(SquishDll)">
+      <Link>squish.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <Target Name="WarnMissingSquishDll" BeforeTargets="Build" Condition="!Exists('$(SquishDll)')">
+    <Warning Text="squish.dll not found at '$(SquishDll)'. The app will build but cannot open archives until squish.dll sits next to WinSquish.exe. Pass -p:SquishDll=... to point at it." />
+  </Target>
+
+</Project>

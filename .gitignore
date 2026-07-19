@@ -1,0 +1,17 @@
+# Build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+publish/
+build/
+*.user
+
+# Rider / VS
+.vs/
+.idea/
+*.suo
+
+# The native library is copied in at build time from ../squish (or -p:SquishDll=).
+# Don't commit a binary copy here.
+squish.dll
