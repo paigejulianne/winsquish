@@ -12,14 +12,21 @@ set "SCRIPT_DIR=%~dp0"
 for %%I in ("%SCRIPT_DIR%..") do set "REPO=%%~fI"
 set "PUBLISH=%REPO%\publish"
 
+REM Resolve the native squish.dll: explicit arg, else the sibling ..\squish checkout.
+if "%SquishDll%"=="" for %%I in ("%REPO%\..\squish\squish.dll") do set "SquishDll=%%~fI"
+if not exist "%SquishDll%" (
+    echo ERROR: squish.dll not found at "%SquishDll%". Pass the path to squish.dll as the first argument, or make sure ..\squish\squish.dll exists.>&2
+    exit /b 1
+)
+
 echo Publishing self-contained build to %PUBLISH% ...
-set "PUB_EXTRA="
-if not "%SquishDll%"=="" set "PUB_EXTRA=-p:SquishDll=%SquishDll%"
-dotnet publish "%REPO%\src\WinSquish.csproj" -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o "%PUBLISH%" %PUB_EXTRA%
+dotnet publish "%REPO%\src\WinSquish.csproj" -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o "%PUBLISH%" "-p:SquishDll=%SquishDll%"
 if errorlevel 1 exit /b 1
 
+REM Single-file publish doesn't reliably stage loose native content, so copy it in.
+copy /y "%SquishDll%" "%PUBLISH%\squish.dll" >nul
 if not exist "%PUBLISH%\squish.dll" (
-    echo ERROR: squish.dll is missing from the publish folder. Pass the path to squish.dll as the first argument, or make sure ..\squish\squish.dll exists.>&2
+    echo ERROR: failed to stage squish.dll into %PUBLISH%.>&2
     exit /b 1
 )
 
