@@ -68,27 +68,49 @@ installer\build-installer.bat
 REM -> build\winsquish-setup.exe
 ```
 
-### Code signing (optional)
+### Code signing
 
-If a code-signing certificate is configured via environment variables, the
-build signs the app binaries (`WinSquish.exe`, `WinSquish.dll`, `squish.dll`)
-**and** the installer plus its embedded uninstaller. With nothing set, the
-build works unchanged and just skips signing. Configure one certificate source:
+The build signs everything with
+[Azure Trusted Signing](https://learn.microsoft.com/azure/trusted-signing/):
+the app binaries (`WinSquish.exe`, `WinSquish.dll`, `squish.dll`) **and** the
+installer plus its embedded uninstaller, SHA-256 and RFC-3161 timestamped.
+
+Signing is driven by `installer\sign.ps1` — a wrapper around the
+[`sign`](https://github.com/dotnet/sign) dotnet tool — and turns on
+automatically whenever `installer\signer.json` is present. That file holds the
+Trusted Signing account details; they are **identifiers only, no secrets**, so
+it is committed:
+
+```json
+{
+  "endpoint": "https://eus.codesigning.azure.net/",
+  "account": "SullivanTechnology",
+  "certificateProfile": "Personal",
+  "timestampUrl": "http://timestamp.acs.microsoft.com/"
+}
+```
+
+Authentication uses your Azure credentials through the tool's
+`DefaultAzureCredential` chain — no key material ever touches the repo:
+
+- **Locally** — run `az login` once.
+- **CI** — set `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET`,
+  or use a managed / workload identity.
+
+Install the signing tool once, then just build:
 
 ```powershell
-# a PFX/P12 file …
-$env:SIGN_PFX = 'C:\certs\winsquish.pfx'; $env:SIGN_PFX_PASSWORD = '…'
-# … or a cert already in a Windows store, by thumbprint …
-$env:SIGN_THUMBPRINT = 'A1B2C3…'
-# … or by subject-name substring.
-$env:SIGN_SUBJECT = 'Paige Julianne Sullivan'
+dotnet tool install --global sign --prerelease   # one-time prerequisite
 
 installer\build-installer.bat   # everything comes out signed + timestamped
 ```
 
-Signing is SHA-256 and RFC-3161 timestamped (`SIGN_TIMESTAMP_URL` overrides the
-default). It needs `signtool.exe` from the Windows SDK on `PATH`, or point
-`SIGNTOOL` at it. See `installer\sign.ps1` for the full contract.
+Any `SIGN_ENDPOINT`, `SIGN_ACCOUNT`, `SIGN_CERTIFICATE_PROFILE`, or
+`SIGN_TIMESTAMP_URL` environment variable overrides the matching `signer.json`
+field (handy in CI). To build **without** signing — e.g. a contributor without
+access to the signing account — remove or rename `installer\signer.json` and
+the build skips signing entirely. See `installer\sign.ps1` for the full
+contract.
 
 ## Requirements
 
@@ -141,6 +163,8 @@ src/
 installer/
   winsquish.iss       Inno Setup script (per-user / all-users)
   build-installer.bat publish + compile the installer
+  sign.ps1            Azure Trusted Signing wrapper (the 'sign' tool)
+  signer.json         Trusted Signing account details (identifiers, no secrets)
 ```
 
 All `libsquish` calls funnel through `SquishArchive`, which serializes them on
